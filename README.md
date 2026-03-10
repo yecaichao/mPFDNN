@@ -1,5 +1,5 @@
-# MPF-DNN
-Material-Property-Field Deep Neural Network (MPF-DNN), an analytical DNN framework integrate Material Property Fields (MPF) with the Hopfield network architectur.
+# mPFDNN
+Material-Property-Field-based Deep Neural Network (mPFDNN), an analytical DNN framework integrate Material Property Fields (MPF) with the Hopfield network architectur.
 
 # Installation
 conda create -n FAMS-DNN python=3.10  
