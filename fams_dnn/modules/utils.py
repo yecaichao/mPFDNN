@@ -38,6 +38,23 @@ def compute_forces(
     return -1 * gradient
 
 
+def compute_edge_forces(
+    energy: torch.Tensor, edge_vectors: torch.Tensor, training: bool = True
+) -> torch.Tensor:
+    grad_outputs: List[Optional[torch.Tensor]] = [torch.ones_like(energy)]
+    gradient = torch.autograd.grad(
+        outputs=[energy],
+        inputs=[edge_vectors],
+        grad_outputs=grad_outputs,
+        retain_graph=training,
+        create_graph=training,
+        allow_unused=True,
+    )[0]
+    if gradient is None:
+        return torch.zeros_like(edge_vectors)
+    return -1 * gradient
+
+
 def compute_forces_virials(
     energy: torch.Tensor,
     positions: torch.Tensor,
@@ -70,6 +87,87 @@ def compute_forces_virials(
         virials = torch.zeros((1, 3, 3))
 
     return -1 * forces, -1 * virials, stress
+
+
+def get_atomic_virials_stresses(
+    edge_forces: torch.Tensor,
+    edge_index: torch.Tensor,
+    edge_vectors: torch.Tensor,
+    batch: torch.Tensor,
+    cell: torch.Tensor,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    receiver = edge_index[1]
+    atomic_virials = scatter_sum(
+        src=torch.einsum("zi,zj->zij", edge_forces, edge_vectors),
+        index=receiver,
+        dim=0,
+        dim_size=batch.shape[0],
+    )
+    atomic_virials = 0.5 * (
+        atomic_virials + atomic_virials.transpose(-1, -2)
+    )
+    cell = cell.view(-1, 3, 3)
+    volume = torch.linalg.det(cell).abs().unsqueeze(-1)
+    atom_volume = volume[batch].view(-1, 1, 1)
+    atomic_stress = torch.where(
+        atom_volume > 0.0,
+        -atomic_virials / atom_volume,
+        torch.zeros_like(atomic_virials),
+    )
+    atomic_stress = torch.where(
+        torch.abs(atomic_stress) < 1e10,
+        atomic_stress,
+        torch.zeros_like(atomic_stress),
+    )
+    return atomic_virials, atomic_stress
+
+
+def compute_atomic_virials(
+    energy: torch.Tensor,
+    edge_vectors: torch.Tensor,
+    edge_index: torch.Tensor,
+    batch: torch.Tensor,
+    cell: torch.Tensor,
+    training: bool = False,
+) -> Optional[torch.Tensor]:
+    edge_forces = compute_edge_forces(
+        energy=energy, edge_vectors=edge_vectors, training=training
+    )
+    atomic_virials, _ = get_atomic_virials_stresses(
+        edge_forces=edge_forces,
+        edge_index=edge_index,
+        edge_vectors=edge_vectors,
+        batch=batch,
+        cell=cell,
+    )
+    return atomic_virials
+
+
+def get_graph_virials_stress_from_atomic_virials(
+    atomic_virials: torch.Tensor,
+    batch: torch.Tensor,
+    cell: torch.Tensor,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    cell = cell.view(-1, 3, 3)
+    num_graphs = cell.shape[0]
+    graph_virials = scatter_sum(
+        src=atomic_virials,
+        index=batch,
+        dim=0,
+        dim_size=num_graphs,
+    )
+    volume = torch.linalg.det(cell).abs().view(-1, 1, 1)
+    graph_stress = torch.where(
+        volume > 0.0,
+        -graph_virials / volume,
+        torch.zeros_like(graph_virials),
+    )
+    graph_stress = torch.where(
+        torch.abs(graph_stress) < 1e10,
+        graph_stress,
+        torch.zeros_like(graph_stress),
+    )
+    return graph_virials, graph_stress
 
 
 def get_symmetric_displacement(
@@ -115,12 +213,48 @@ def get_outputs(
     positions: torch.Tensor,
     displacement: Optional[torch.Tensor],
     cell: torch.Tensor,
+    edge_vectors: Optional[torch.Tensor] = None,
+    edge_index: Optional[torch.Tensor] = None,
+    batch: Optional[torch.Tensor] = None,
+    atomic_virials: Optional[torch.Tensor] = None,
     training: bool = False,
     compute_force: bool = True,
     compute_virials: bool = True,
     compute_stress: bool = True,
+    virials_impl: str = "atomic",
 ) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor], Optional[torch.Tensor]]:
-    if (compute_virials or compute_stress) and displacement is not None:
+    use_atomic_virials = (
+        virials_impl == "atomic"
+        and (compute_virials or compute_stress)
+        and batch is not None
+        and (
+            atomic_virials is not None
+            or (edge_vectors is not None and edge_index is not None)
+        )
+    )
+    if use_atomic_virials:
+        if atomic_virials is None:
+            assert edge_vectors is not None
+            assert edge_index is not None
+            atomic_virials = compute_atomic_virials(
+                energy=energy,
+                edge_vectors=edge_vectors,
+                edge_index=edge_index,
+                batch=batch,
+                cell=cell,
+                training=training,
+            )
+        virials, stress = get_graph_virials_stress_from_atomic_virials(
+            atomic_virials=atomic_virials,
+            batch=batch,
+            cell=cell,
+        )
+        forces = (
+            compute_forces(energy=energy, positions=positions, training=training)
+            if compute_force
+            else None
+        )
+    elif (compute_virials or compute_stress) and displacement is not None:
         # forces come for free
         forces, virials, stress = compute_forces_virials(
             energy=energy,

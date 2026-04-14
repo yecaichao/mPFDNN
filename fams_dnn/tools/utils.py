@@ -137,12 +137,15 @@ class UniversalEncoder(json.JSONEncoder):
 
 
 class MetricsLogger:
-    def __init__(self, directory: str, tag: str) -> None:
+    def __init__(self, directory: str, tag: str, enabled: bool = True) -> None:
         self.directory = directory
         self.filename = tag + ".txt"
         self.path = os.path.join(self.directory, self.filename)
+        self.enabled = enabled
 
     def log(self, d: Dict[str, Any]) -> None:
+        if not self.enabled:
+            return
         logging.debug(f"Saving info: {self.path}")
         os.makedirs(name=self.directory, exist_ok=True)
         with open(self.path, mode="a", encoding="utf-8") as f:

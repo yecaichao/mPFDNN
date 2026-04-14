@@ -112,10 +112,33 @@ def main() -> None:
                     atomic_energies_dict = data.compute_average_E0s(
                         collections.train, z_table
                     )
+                elif args.E0s.lower() == "reference":
+                    if args.E0s_reference_file is None:
+                        raise RuntimeError(
+                            "E0s='reference' requires --E0s_reference_file"
+                        )
+                    logging.info(
+                        "Computing atomic energies from manual reference-state file '%s'",
+                        args.E0s_reference_file,
+                    )
+                    atomic_energies_dict = data.compute_reference_E0s(
+                        file_path=args.E0s_reference_file,
+                        z_table=z_table,
+                        energy_key=args.energy_key,
+                        forces_key=args.forces_key,
+                        stress_key=args.stress_key,
+                        virials_key=args.virials_key,
+                        dipole_key=args.dipole_key,
+                        charges_key=args.charges_key,
+                        config_type_weights=config_type_weights,
+                    )
                 else:
                     try:
-                        atomic_energies_dict = ast.literal_eval(args.E0s)
-                        assert isinstance(atomic_energies_dict, dict)
+                        atomic_energies_source = ast.literal_eval(args.E0s)
+                        assert isinstance(atomic_energies_source, dict)
+                        atomic_energies_dict = data.normalize_atomic_energies_dict(
+                            atomic_energies_source, z_table
+                        )
                     except Exception as e:
                         raise RuntimeError(
                             f"E0s specified invalidly, error {e} occurred"
@@ -174,6 +197,18 @@ def main() -> None:
             stress_weight=args.stress_weight,
             huber_delta=args.huber_delta,
         )
+    elif args.loss == "universal":
+        loss_fn = modules.UniversalLoss(
+            energy_weight=args.energy_weight,
+            forces_weight=args.forces_weight,
+            stress_weight=args.stress_weight,
+            huber_delta=args.huber_delta,
+        )
+    elif args.loss == "l1l2energyforces":
+        loss_fn = modules.WeightedEnergyForcesL1L2Loss(
+            energy_weight=args.energy_weight,
+            forces_weight=args.forces_weight,
+        )
     elif args.loss == "dipole":
         assert (
             dipole_only is True
@@ -199,7 +234,7 @@ def main() -> None:
 
     # Selecting outputs
     compute_virials = False
-    if args.loss in ("stress", "virials", "huber"):
+    if args.loss in ("stress", "virials", "huber", "universal"):
         compute_virials = True
         args.compute_stress = True
         args.error_table = "PerAtomRMSEstressvirials"
@@ -210,6 +245,7 @@ def main() -> None:
         "virials": compute_virials,
         "stress": args.compute_stress,
         "dipoles": compute_dipole,
+        "virials_impl": args.virials_impl,
     }
     logging.info(f"Selected the following outputs: {output_args}")
 
@@ -408,6 +444,18 @@ def main() -> None:
                 energy_weight=args.swa_energy_weight,
                 forces_weight=args.swa_forces_weight,
                 stress_weight=args.swa_stress_weight,
+            )
+        elif args.loss == "universal":
+            loss_fn_energy = modules.UniversalLoss(
+                energy_weight=args.swa_energy_weight,
+                forces_weight=args.swa_forces_weight,
+                stress_weight=args.swa_stress_weight,
+                huber_delta=args.huber_delta,
+            )
+        elif args.loss == "l1l2energyforces":
+            loss_fn_energy = modules.WeightedEnergyForcesL1L2Loss(
+                energy_weight=args.swa_energy_weight,
+                forces_weight=args.swa_forces_weight,
             )
         elif args.loss == "energy_forces_dipole":
             loss_fn_energy = modules.WeightedEnergyForcesDipoleLoss(

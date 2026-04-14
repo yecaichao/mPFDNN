@@ -54,7 +54,13 @@ from .models import (
 from .mymodels import (
     FAMS_DNN
 )
-from .radial import BesselBasis, GaussianBasis, PolynomialCutoff, ChebyshevBasis
+from .radial import (
+    BesselBasis,
+    GaussianBasis,
+    PolynomialCutoff,
+    ChebyshevBasis,
+    PairwiseTanhChebyshevBasis,
+)
 from .symmetric_contraction import SymmetricContraction
 from .utils import (
     compute_avg_num_neighbors,
@@ -101,6 +107,7 @@ __all__ = [
     "PolynomialCutoff",
     "BesselBasis",
     "ChebyshevBasis",
+    "PairwiseTanhChebyshevBasis",
     "GaussianBasis",
     "MACE",
     "ScaleShiftMACE",

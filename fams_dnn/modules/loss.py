@@ -32,14 +32,20 @@ def reduce_loss(raw_loss: torch.Tensor, ddp: Optional[bool] = None) -> torch.Ten
     """
     ddp = is_ddp_enabled() if ddp is None else ddp
     if ddp and dist.is_initialized():
-        world_size = dist.get_world_size()
+        # Keep the differentiable loss path local. DDP will synchronize gradients for us.
+        if raw_loss.requires_grad:
+            return raw_loss.mean()
+        # NCCL backends cannot all-reduce CPU tensors.
+        if raw_loss.device.type == "cpu":
+            return raw_loss.mean()
         n_local = raw_loss.numel()
         loss_sum = raw_loss.sum()
         total_samples = torch.tensor(
             n_local, device=raw_loss.device, dtype=raw_loss.dtype
         )
+        dist.all_reduce(loss_sum, op=dist.ReduceOp.SUM)
         dist.all_reduce(total_samples, op=dist.ReduceOp.SUM)
-        return loss_sum * world_size / total_samples
+        return loss_sum / total_samples
     return raw_loss.mean()
 
 
@@ -409,13 +415,18 @@ class UniversalLoss(torch.nn.Module):
                 huber_delta=self.huber_delta,
                 ddp=ddp,
             )
-            loss_stress = torch.nn.functional.huber_loss(
-                configs_stress_weight * ref["stress"],
-                configs_stress_weight * pred["stress"],
-                reduction="none",
-                delta=self.huber_delta,
-            )
-            loss_stress = reduce_loss(loss_stress, ddp)
+            ref_stress = getattr(ref, "stress", None)
+            pred_stress = pred.get("stress")
+            if pred_stress is not None and ref_stress is not None:
+                loss_stress = torch.nn.functional.huber_loss(
+                    configs_stress_weight * ref_stress,
+                    configs_stress_weight * pred_stress,
+                    reduction="none",
+                    delta=self.huber_delta,
+                )
+                loss_stress = reduce_loss(loss_stress, ddp)
+            else:
+                loss_stress = pred["energy"].new_zeros(())
         else:
             loss_energy = torch.nn.functional.huber_loss(
                 configs_energy_weight * ref["energy"] / num_atoms,
@@ -429,12 +440,17 @@ class UniversalLoss(torch.nn.Module):
                 huber_delta=self.huber_delta,
                 ddp=ddp,
             )
-            loss_stress = torch.nn.functional.huber_loss(
-                configs_stress_weight * ref["stress"],
-                configs_stress_weight * pred["stress"],
-                reduction="mean",
-                delta=self.huber_delta,
-            )
+            ref_stress = getattr(ref, "stress", None)
+            pred_stress = pred.get("stress")
+            if pred_stress is not None and ref_stress is not None:
+                loss_stress = torch.nn.functional.huber_loss(
+                    configs_stress_weight * ref_stress,
+                    configs_stress_weight * pred_stress,
+                    reduction="mean",
+                    delta=self.huber_delta,
+                )
+            else:
+                loss_stress = pred["energy"].new_zeros(())
         return (
             self.energy_weight * loss_energy
             + self.forces_weight * loss_forces

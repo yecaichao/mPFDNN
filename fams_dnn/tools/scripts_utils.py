@@ -199,15 +199,18 @@ def create_error_table(
             "rel MU RMSE %",
         ]
     for name, subset in all_collections:
-        data_loader = torch_geometric.dataloader.DataLoader(
-            dataset=[
-                AtomicData.from_config(config, z_table=z_table, cutoff=r_max)
-                for config in subset
-            ],
-            batch_size=valid_batch_size,
-            shuffle=False,
-            drop_last=False,
-        )
+        if isinstance(subset, torch.utils.data.DataLoader):
+            data_loader = subset
+        else:
+            data_loader = torch_geometric.dataloader.DataLoader(
+                dataset=[
+                    AtomicData.from_config(config, z_table=z_table, cutoff=r_max)
+                    for config in subset
+                ],
+                batch_size=valid_batch_size,
+                shuffle=False,
+                drop_last=False,
+            )
 
         logging.info(f"Evaluating {name} ...")
         _, metrics = evaluate(

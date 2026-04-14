@@ -99,6 +99,7 @@ class Contraction(torch.nn.Module):
         self.num_features = irreps_in.count((0, 1))
         self.coupling_irreps = o3.Irreps([irrep.ir for irrep in irreps_in])
         self.correlation = correlation
+        self.scalar_fastpath = self.coupling_irreps.dim == 1 and irrep_out.lmax == 0
         dtype = torch.get_default_dtype()
         if self.coupling_irreps.dim == 1:
             for nu in range(1, correlation + 1):
@@ -121,6 +122,21 @@ class Contraction(torch.nn.Module):
 
         # Create weight for product basis
         self.weights = torch.nn.ParameterList([])
+
+        if self.scalar_fastpath:
+            self.weights_max = torch.nn.Parameter(
+                torch.randn((num_elements, 1, self.num_features))
+            )
+            for _ in range(correlation - 1):
+                self.weights.append(
+                    torch.nn.Parameter(
+                        torch.randn((num_elements, 1, self.num_features))
+                    )
+                )
+            if not internal_weights:
+                self.weights = weights[:-1]
+                self.weights_max = weights[-1]
+            return
 
         for i in range(correlation, 0, -1):
             # Shapes definying
@@ -216,6 +232,13 @@ class Contraction(torch.nn.Module):
             self.weights_max = weights[-1]
 
     def forward(self, x: torch.Tensor, y: torch.Tensor):
+        if self.scalar_fastpath:
+            x_scalar = x[..., 0]
+            out = torch.einsum("be,ekc->bc", y, self.weights_max) * x_scalar
+            for weight in self.weights:
+                out = (torch.einsum("be,ekc->bc", y, weight) + out) * x_scalar
+            return out
+
         out = self.graph_opt_main(
             self.U_tensors(self.correlation),
             self.weights_max,

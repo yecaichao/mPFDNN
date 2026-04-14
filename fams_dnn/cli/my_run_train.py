@@ -11,16 +11,18 @@ from pathlib import Path
 from typing import Optional
 
 import numpy as np
-import torch.nn.functional
+import torch
+from torch.nn.parallel import DistributedDataParallel
+from torch.utils.data.distributed import DistributedSampler
 from e3nn import o3
 from torch.optim.swa_utils import SWALR, AveragedModel
 from torch_ema import ExponentialMovingAverage
 
-import ptagnn
 from ptagnn import data, modules, tools
 from ptagnn.tools import torch_geometric
 from ptagnn.tools.scripts_utils import (
     LRScheduler,
+    SubsetCollection,
     create_error_table,
     get_dataset_from_xyz,
 )
@@ -31,11 +33,24 @@ def main() -> None:
     tag = tools.get_tag(name=args.name, seed=args.seed)
 
     # Setup
-    tools.set_seeds(args.seed)
-    tools.setup_logger(level=args.log_level, tag=tag, directory=args.log_dir)
-    logging.info(f"Configuration: {args}")
-    device = tools.init_device(args.device)
     tools.set_default_dtype(args.default_dtype)
+    device = tools.init_distributed_if_needed(args.device)
+    distributed = tools.is_distributed_env()
+    rank = tools.get_rank()
+    world_size = tools.get_world_size()
+    is_rank_zero = tools.is_rank_zero()
+    tools.set_seeds(args.seed)
+    if is_rank_zero:
+        tools.setup_logger(level=args.log_level, tag=tag, directory=args.log_dir)
+        logging.info(f"Configuration: {args}")
+    else:
+        logging.basicConfig(level=logging.ERROR)
+    logging.info(
+        "Process info: rank=%d world_size=%d device=%s",
+        rank,
+        world_size,
+        device,
+    )
 
     try:
         config_type_weights = ast.literal_eval(args.config_type_weights)
@@ -46,36 +61,152 @@ def main() -> None:
         )
         config_type_weights = {"Default": 1.0}
 
+    if args.stream_train and args.valid_file is None:
+        raise RuntimeError(
+            "Streaming training requires --valid_file because random train/valid splitting "
+            "needs the full training set in memory"
+        )
+
     # Data preparation
-    collections, atomic_energies_dict = get_dataset_from_xyz(
-        train_path=args.train_file,
-        valid_path=args.valid_file,
-        valid_fraction=args.valid_fraction,
-        config_type_weights=config_type_weights,
-        test_path=args.test_file,
-        seed=args.seed,
-        energy_key=args.energy_key,
-        forces_key=args.forces_key,
-        stress_key=args.stress_key,
-        virials_key=args.virials_key,
-        dipole_key=args.dipole_key,
-        charges_key=args.charges_key,
-    )
+    train_has_stress_labels = False
+    train_has_virials_labels = False
+    train_num_configs = 0
+    train_eval_loader = None
+    avg_neighbors_dataset = None
+    stream_cache_path = None
+    valid_atomic_numbers = []
+
+    if args.stream_train:
+        stream_cache_path = data.default_stream_cache_path(
+            cache_dir=args.downloads_dir,
+            file_path=args.train_file,
+        )
+        logging.info("Using stream cache file '%s'", stream_cache_path)
+        train_stats = data.load_cached_stream_stats(
+            cache_path=stream_cache_path,
+            file_path=args.train_file,
+            config_type_weights=config_type_weights,
+            energy_key=args.energy_key,
+            forces_key=args.forces_key,
+            stress_key=args.stress_key,
+            virials_key=args.virials_key,
+            dipole_key=args.dipole_key,
+            charges_key=args.charges_key,
+        )
+        if train_stats is None:
+            train_stats = data.scan_xyz_stream(
+                file_path=args.train_file,
+                config_type_weights=config_type_weights,
+                energy_key=args.energy_key,
+                forces_key=args.forces_key,
+                stress_key=args.stress_key,
+                virials_key=args.virials_key,
+                dipole_key=args.dipole_key,
+                charges_key=args.charges_key,
+                extract_atomic_energies=True,
+            )
+            data.save_cached_stream_stats(
+                cache_path=stream_cache_path,
+                file_path=args.train_file,
+                config_type_weights=config_type_weights,
+                energy_key=args.energy_key,
+                forces_key=args.forces_key,
+                stress_key=args.stress_key,
+                virials_key=args.virials_key,
+                dipole_key=args.dipole_key,
+                charges_key=args.charges_key,
+                stats=train_stats,
+            )
+            logging.info("Saved streamed dataset metadata cache to '%s'", stream_cache_path)
+        atomic_energies_dict = train_stats.atomic_energies_dict
+        train_has_stress_labels = train_stats.has_stress_labels
+        train_has_virials_labels = train_stats.has_virials_labels
+        train_num_configs = train_stats.num_configs
+        if train_num_configs == 0:
+            raise RuntimeError("No non-isolated training configurations found in streamed train_file")
+
+        test_configs = []
+        if is_rank_zero:
+            _, valid_configs = data.load_from_xyz(
+                file_path=args.valid_file,
+                config_type_weights=config_type_weights,
+                energy_key=args.energy_key,
+                forces_key=args.forces_key,
+                stress_key=args.stress_key,
+                virials_key=args.virials_key,
+                dipole_key=args.dipole_key,
+                charges_key=args.charges_key,
+                extract_atomic_energies=False,
+            )
+            logging.info(
+                f"Loaded {len(valid_configs)} validation configurations from '{args.valid_file}'"
+            )
+            valid_atomic_numbers = [
+                int(z)
+                for config in valid_configs
+                for z in config.atomic_numbers
+            ]
+
+            if args.test_file is not None:
+                _, all_test_configs = data.load_from_xyz(
+                    file_path=args.test_file,
+                    config_type_weights=config_type_weights,
+                    energy_key=args.energy_key,
+                    forces_key=args.forces_key,
+                    dipole_key=args.dipole_key,
+                    charges_key=args.charges_key,
+                    extract_atomic_energies=False,
+                )
+                test_configs = data.test_config_types(all_test_configs)
+                logging.info(
+                    f"Loaded {len(all_test_configs)} test configurations from '{args.test_file}'"
+                )
+        else:
+            valid_configs = []
+
+        if distributed:
+            valid_atomic_numbers = tools.broadcast_object(
+                valid_atomic_numbers if is_rank_zero else None,
+                src=0,
+            )
+
+        collections = SubsetCollection(train=[], valid=valid_configs, tests=test_configs)
+        z_sources = list(train_stats.atomic_numbers) + list(valid_atomic_numbers)
+    else:
+        collections, atomic_energies_dict = get_dataset_from_xyz(
+            train_path=args.train_file,
+            valid_path=args.valid_file,
+            valid_fraction=args.valid_fraction,
+            config_type_weights=config_type_weights,
+            test_path=args.test_file,
+            seed=args.seed,
+            energy_key=args.energy_key,
+            forces_key=args.forces_key,
+            stress_key=args.stress_key,
+            virials_key=args.virials_key,
+            dipole_key=args.dipole_key,
+            charges_key=args.charges_key,
+        )
+        train_num_configs = len(collections.train)
+        train_has_stress_labels = any(
+            float(config.stress_weight) > 0.0 for config in collections.train
+        )
+        train_has_virials_labels = any(
+            float(config.virials_weight) > 0.0 for config in collections.train
+        )
+        z_sources = [
+            z
+            for configs in (collections.train, collections.valid)
+            for config in configs
+            for z in config.atomic_numbers
+        ]
 
     logging.info(
-        f"Total number of configurations: train={len(collections.train)}, valid={len(collections.valid)}, "
+        f"Total number of configurations: train={train_num_configs}, valid={len(collections.valid)}, "
         f"tests=[{', '.join([name + ': ' + str(len(test_configs)) for name, test_configs in collections.tests])}]"
     )
 
-    # Atomic number table
-    # yapf: disable
-    z_table = tools.get_atomic_number_table_from_zs(
-        z
-        for configs in (collections.train, collections.valid)
-        for config in configs
-        for z in config.atomic_numbers
-    )
-    # yapf: enable
+    z_table = tools.get_atomic_number_table_from_zs(z_sources)
     logging.info(z_table)
     if args.model == "AtomicDipolesMACE":
         atomic_energies = None
@@ -102,16 +233,54 @@ def main() -> None:
                     "Atomic Energies not in training file, using command line argument E0s"
                 )
                 if args.E0s == "average":
+                    if args.stream_train:
+                        if is_rank_zero:
+                            if len(collections.valid) == 0:
+                                raise RuntimeError(
+                                    "E0s='average' with --stream_train requires a non-empty validation set"
+                                )
+                            logging.info(
+                                "Computing average Atomic Energies from the validation set during streamed training"
+                            )
+                            atomic_energies_dict = data.compute_average_E0s(
+                                collections.valid, z_table
+                            )
+                        else:
+                            atomic_energies_dict = None
+                    else:
+                        logging.info(
+                            "Computing average Atomic Energies using least squares regression"
+                        )
+                        atomic_energies_dict = data.compute_average_E0s(
+                            collections.train, z_table
+                        )
+                elif args.E0s == "reference":
+                    if args.E0s_reference_file is None:
+                        raise RuntimeError(
+                            "E0s='reference' requires --E0s_reference_file"
+                        )
                     logging.info(
-                        "Computing average Atomic Energies using least squares regression"
+                        "Computing atomic energies from manual reference-state file '%s'",
+                        args.E0s_reference_file,
                     )
-                    atomic_energies_dict = data.compute_average_E0s(
-                        collections.train, z_table
+                    atomic_energies_dict = data.compute_reference_E0s(
+                        file_path=args.E0s_reference_file,
+                        z_table=z_table,
+                        energy_key=args.energy_key,
+                        forces_key=args.forces_key,
+                        stress_key=args.stress_key,
+                        virials_key=args.virials_key,
+                        dipole_key=args.dipole_key,
+                        charges_key=args.charges_key,
+                        config_type_weights=config_type_weights,
                     )
                 else:
                     try:
-                        atomic_energies_dict = ast.literal_eval(args.E0s)
-                        assert isinstance(atomic_energies_dict, dict)
+                        atomic_energies_source = ast.literal_eval(args.E0s)
+                        assert isinstance(atomic_energies_source, dict)
+                        atomic_energies_dict = data.normalize_atomic_energies_dict(
+                            atomic_energies_source, z_table
+                        )
                     except Exception as e:
                         raise RuntimeError(
                             f"E0s specified invalidly, error {e} occurred"
@@ -120,35 +289,136 @@ def main() -> None:
                 raise RuntimeError(
                     "E0s not found in training file and not specified in command line"
                 )
+        if distributed:
+            atomic_energies_dict = tools.broadcast_object(
+                atomic_energies_dict if is_rank_zero else None,
+                src=0,
+            )
         atomic_energies: np.ndarray = np.array(
             [atomic_energies_dict[z] for z in z_table.zs]
         )
         logging.info(f"Atomic energies: {atomic_energies.tolist()}")
 
     logging.info(f"Reading train file")
-    train_loader = torch_geometric.dataloader.DataLoader(
-        dataset=[
+    train_dataloader_kwargs = dict(
+        pin_memory=args.pin_memory,
+        num_workers=args.num_workers,
+    )
+    eval_dataloader_kwargs = dict(train_dataloader_kwargs)
+    if args.num_workers > 0:
+        train_persistent_workers = args.persistent_workers
+        if args.stream_train and train_persistent_workers:
+            logging.info(
+                "Disabling persistent_workers for streamed training data so worker state can refresh each epoch"
+            )
+            train_persistent_workers = False
+        train_dataloader_kwargs["persistent_workers"] = train_persistent_workers
+        train_dataloader_kwargs["prefetch_factor"] = args.prefetch_factor
+        eval_dataloader_kwargs["persistent_workers"] = args.persistent_workers
+        eval_dataloader_kwargs["prefetch_factor"] = args.prefetch_factor
+
+    if args.stream_train:
+        train_dataset = data.StreamingAtomicDataDataset(
+            file_path=args.train_file,
+            z_table=z_table,
+            cutoff=args.r_max,
+            config_type_weights=config_type_weights,
+            energy_key=args.energy_key,
+            forces_key=args.forces_key,
+            stress_key=args.stress_key,
+            virials_key=args.virials_key,
+            dipole_key=args.dipole_key,
+            charges_key=args.charges_key,
+            num_configs=train_num_configs,
+            rank=rank if distributed else 0,
+            world_size=world_size if distributed else 1,
+            seed=args.seed,
+            shuffle_buffer_size=args.stream_shuffle_buffer_size,
+            drop_remainder_across_ranks=distributed,
+        )
+        avg_neighbors_dataset = data.StreamingAtomicDataDataset(
+            file_path=args.train_file,
+            z_table=z_table,
+            cutoff=args.r_max,
+            config_type_weights=config_type_weights,
+            energy_key=args.energy_key,
+            forces_key=args.forces_key,
+            stress_key=args.stress_key,
+            virials_key=args.virials_key,
+            dipole_key=args.dipole_key,
+            charges_key=args.charges_key,
+            num_configs=train_num_configs,
+            rank=0,
+            world_size=1,
+            seed=args.seed,
+            shuffle_buffer_size=0,
+            drop_remainder_across_ranks=False,
+        )
+    else:
+        train_dataset = [
             data.AtomicData.from_config(config, z_table=z_table, cutoff=args.r_max)
             for config in collections.train
-        ],
+        ]
+
+    valid_dataset = None
+    train_sampler = (
+        DistributedSampler(
+            train_dataset,
+            num_replicas=world_size,
+            rank=rank,
+            shuffle=True,
+            drop_last=True,
+        )
+        if distributed and not args.stream_train
+        else None
+    )
+    train_loader = torch_geometric.dataloader.DataLoader(
+        dataset=train_dataset,
         batch_size=args.batch_size,
-        shuffle=True,
+        shuffle=(train_sampler is None) and not args.stream_train,
+        sampler=train_sampler,
         drop_last=True,
-        pin_memory=args.pin_memory,
-        num_workers=args.num_workers,
+        **train_dataloader_kwargs,
     )
     logging.info(f"Reading valid file")
-    valid_loader = torch_geometric.dataloader.DataLoader(
-        dataset=[
+    valid_loader = None
+    if is_rank_zero:
+        valid_dataset = [
             data.AtomicData.from_config(config, z_table=z_table, cutoff=args.r_max)
             for config in collections.valid
-        ],
-        batch_size=args.valid_batch_size,
-        shuffle=False,
-        drop_last=False,
-        pin_memory=args.pin_memory,
-        num_workers=args.num_workers,
-    )
+        ]
+        valid_loader = torch_geometric.dataloader.DataLoader(
+            dataset=valid_dataset,
+            batch_size=args.valid_batch_size,
+            shuffle=False,
+            drop_last=False,
+            **eval_dataloader_kwargs,
+        )
+        if args.stream_train:
+            train_eval_loader = torch_geometric.dataloader.DataLoader(
+                dataset=data.StreamingAtomicDataDataset(
+                    file_path=args.train_file,
+                    z_table=z_table,
+                    cutoff=args.r_max,
+                    config_type_weights=config_type_weights,
+                    energy_key=args.energy_key,
+                    forces_key=args.forces_key,
+                    stress_key=args.stress_key,
+                    virials_key=args.virials_key,
+                    dipole_key=args.dipole_key,
+                    charges_key=args.charges_key,
+                    num_configs=train_num_configs,
+                    rank=0,
+                    world_size=1,
+                    seed=args.seed,
+                    shuffle_buffer_size=0,
+                    drop_remainder_across_ranks=False,
+                ),
+                batch_size=args.valid_batch_size,
+                shuffle=False,
+                drop_last=False,
+                **eval_dataloader_kwargs,
+            )
 
     loss_fn: torch.nn.Module
     if args.loss == "weighted":
@@ -176,6 +446,18 @@ def main() -> None:
             stress_weight=args.stress_weight,
             huber_delta=args.huber_delta,
         )
+    elif args.loss == "universal":
+        loss_fn = modules.UniversalLoss(
+            energy_weight=args.energy_weight,
+            forces_weight=args.forces_weight,
+            stress_weight=args.stress_weight,
+            huber_delta=args.huber_delta,
+        )
+    elif args.loss == "l1l2energyforces":
+        loss_fn = modules.WeightedEnergyForcesL1L2Loss(
+            energy_weight=args.energy_weight,
+            forces_weight=args.forces_weight,
+        )
     elif args.loss == "dipole":
         assert (
             dipole_only is True
@@ -195,16 +477,58 @@ def main() -> None:
         loss_fn = modules.WeightedEnergyForcesLoss(energy_weight=1.0, forces_weight=1.0)
     logging.info(loss_fn)
 
+    has_stress_labels = train_has_stress_labels
+    has_virials_labels = train_has_virials_labels
+    has_stress_or_virial_labels = has_stress_labels or has_virials_labels
+
     if args.compute_avg_num_neighbors:
-        args.avg_num_neighbors = modules.compute_avg_num_neighbors(train_loader)
+        avg_neighbors_source = (
+            valid_dataset
+            if args.stream_train and valid_dataset is not None and len(valid_dataset) > 0
+            else (avg_neighbors_dataset if args.stream_train else train_dataset)
+        )
+        if (
+            args.stream_train
+            and valid_dataset is not None
+            and len(valid_dataset) > 0
+            and is_rank_zero
+        ):
+            logging.info(
+                "Estimating avg_num_neighbors from the validation subset during streamed training "
+                "to avoid a long rank-0 scan of the full training stream"
+            )
+        avg_num_neighbors = (
+            modules.compute_avg_num_neighbors(
+                torch_geometric.dataloader.DataLoader(
+                    dataset=avg_neighbors_source,
+                    batch_size=args.batch_size,
+                    shuffle=False,
+                    drop_last=False,
+                    **eval_dataloader_kwargs,
+                )
+            )
+            if is_rank_zero
+            else None
+        )
+        args.avg_num_neighbors = tools.broadcast_object(avg_num_neighbors, src=0)
     logging.info(f"Average number of neighbors: {args.avg_num_neighbors}")
 
     # Selecting outputs
     compute_virials = False
-    if args.loss in ("stress", "virials", "huber"):
-        compute_virials = True
-        args.compute_stress = True
-        args.error_table = "PerAtomRMSEstressvirials"
+    if args.loss in ("stress", "virials", "huber", "universal"):
+        if has_stress_or_virial_labels:
+            compute_virials = True
+            args.compute_stress = True
+            args.error_table = "PerAtomRMSEstressvirials"
+        else:
+            logging.info(
+                "No stress/virial labels found in training data; disabling stress/virial computations for loss=%s",
+                args.loss,
+            )
+            compute_virials = False
+            args.compute_stress = False
+            if args.error_table == "PerAtomRMSEstressvirials":
+                args.error_table = "PerAtomRMSE"
 
     output_args = {
         "energy": compute_energy,
@@ -212,6 +536,7 @@ def main() -> None:
         "virials": compute_virials,
         "stress": args.compute_stress,
         "dipoles": compute_dipole,
+        "virials_impl": args.virials_impl,
     }
     logging.info(f"Selected the following outputs: {output_args}")
 
@@ -247,17 +572,24 @@ def main() -> None:
 
     model: torch.nn.Module
     if args.model == "FAMS_DNN":
-        mean, std = modules.scaling_classes[args.scaling](train_loader, atomic_energies)
+        logging.info(
+            "FAMS_DNN uses trainable element-dependent interaction scales initialized to 1.0 and fixed interaction shift 0.0"
+        )
         model = modules.FAMS_DNN(
             **model_config,
             correlation=args.product,
             gate=modules.gate_dict[args.gate],
             make_linear_basis=modules.interaction_classes[args.interaction_first],
             MLP_irreps=o3.Irreps(args.MLP_irreps),
-            atomic_inter_scale=std,
-            atomic_inter_shift=mean,
+            atomic_inter_scale=1.0,
+            atomic_inter_shift=0.0,
             radial_MLP=ast.literal_eval(args.radial_MLP),
             radial_type=args.radial_type,
+            pair_scaling=args.pair_scaling,
+            radial_with_l=args.radial_with_l,
+            radial_version=args.radial_version,
+            activation_checkpointing=args.activation_checkpoint,
+            use_self_connection=args.use_self_connection,
         )
     else:
         raise RuntimeError(f"Unknown model: '{args.model}'")
@@ -272,34 +604,82 @@ def main() -> None:
         else:
             no_decay_interactions[name] = param
 
+    pair_scaling_params = list(tools.get_pair_scaling_params(model))
+    pair_scaling_param_ids = {id(param) for param in pair_scaling_params}
+    radial_embedding_params = [
+        param
+        for param in model.radial_embedding.parameters()
+        if id(param) not in pair_scaling_param_ids
+    ]
+    pair_scaling_lr = (
+        args.pair_scaling_lr if args.pair_scaling_lr is not None else args.lr * 5.0
+    )
+    if pair_scaling_params:
+        logging.info(
+            "Using pair_scaling_lr=%.6g for %d pair-scaling parameter tensors",
+            pair_scaling_lr,
+            len(pair_scaling_params),
+        )
+    elif args.pair_scaling_lr is not None:
+        logging.info(
+            "pair_scaling_lr was set to %.6g, but no pair-scaling parameters were found",
+            args.pair_scaling_lr,
+        )
+
+    param_groups = [
+        {
+            "name": "embedding",
+            "params": model.node_embedding.parameters(),
+            "weight_decay": 0.0,
+        },
+        {
+            "name": "scale_shift",
+            "params": model.scale_shift.parameters(),
+            "weight_decay": 0.0,
+        },
+        {
+            "name": "interactions_decay",
+            "params": list(decay_interactions.values()),
+            "weight_decay": args.weight_decay,
+        },
+        {
+            "name": "interactions_no_decay",
+            "params": list(no_decay_interactions.values()),
+            "weight_decay": 0.0,
+        },
+        {
+            "name": "products",
+            "params": model.products.parameters(),
+            "weight_decay": args.weight_decay,
+        },
+        {
+            "name": "readouts",
+            "params": model.readouts.parameters(),
+            "weight_decay": 0.0,
+        },
+    ]
+    if radial_embedding_params:
+        param_groups.insert(
+            1,
+            {
+                "name": "radial_embedding",
+                "params": radial_embedding_params,
+                "weight_decay": 0.0,
+            },
+        )
+    if pair_scaling_params:
+        param_groups.insert(
+            2,
+            {
+                "name": "pair_scaling",
+                "params": pair_scaling_params,
+                "weight_decay": 0.0,
+                "lr": pair_scaling_lr,
+            },
+        )
+
     param_options = dict(
-        params=[
-            {
-                "name": "embedding",
-                "params": model.node_embedding.parameters(),
-                "weight_decay": 0.0,
-            },
-            {
-                "name": "interactions_decay",
-                "params": list(decay_interactions.values()),
-                "weight_decay": args.weight_decay,
-            },
-            {
-                "name": "interactions_no_decay",
-                "params": list(no_decay_interactions.values()),
-                "weight_decay": 0.0,
-            },
-            {
-                "name": "products",
-                "params": model.products.parameters(),
-                "weight_decay": args.weight_decay,
-            },
-            {
-                "name": "readouts",
-                "params": model.readouts.parameters(),
-                "weight_decay": 0.0,
-            },
-        ],
+        params=param_groups,
         lr=args.lr,
         amsgrad=args.amsgrad,
     )
@@ -310,7 +690,23 @@ def main() -> None:
     else:
         optimizer = torch.optim.Adam(**param_options)
 
-    logger = tools.MetricsLogger(directory=args.results_dir, tag=tag + "_train")
+    if distributed:
+        if device.type == "cuda":
+            model = DistributedDataParallel(
+                model,
+                device_ids=[tools.get_local_rank()],
+                output_device=tools.get_local_rank(),
+                find_unused_parameters=True,
+            )
+        else:
+            model = DistributedDataParallel(
+                model,
+                find_unused_parameters=True,
+            )
+
+    logger = tools.MetricsLogger(
+        directory=args.results_dir, tag=tag + "_train", enabled=is_rank_zero
+    )
 
     lr_scheduler = LRScheduler(optimizer, args)
 
@@ -336,6 +732,18 @@ def main() -> None:
                 energy_weight=args.swa_energy_weight,
                 forces_weight=args.swa_forces_weight,
                 stress_weight=args.swa_stress_weight,
+            )
+        elif args.loss == "universal":
+            loss_fn_energy = modules.UniversalLoss(
+                energy_weight=args.swa_energy_weight,
+                forces_weight=args.swa_forces_weight,
+                stress_weight=args.swa_stress_weight,
+                huber_delta=args.huber_delta,
+            )
+        elif args.loss == "l1l2energyforces":
+            loss_fn_energy = modules.WeightedEnergyForcesL1L2Loss(
+                energy_weight=args.swa_energy_weight,
+                forces_weight=args.swa_forces_weight,
             )
         elif args.loss == "energy_forces_dipole":
             loss_fn_energy = modules.WeightedEnergyForcesDipoleLoss(
@@ -398,7 +806,7 @@ def main() -> None:
     logging.info(f"Number of parameters: {tools.count_parameters(model)}")
     logging.info(f"Optimizer: {optimizer}")
 
-    if args.wandb:
+    if args.wandb and is_rank_zero:
         logging.info("Using Weights and Biases for logging")
         import wandb
 
@@ -424,8 +832,12 @@ def main() -> None:
         lr_scheduler=lr_scheduler,
         checkpoint_handler=checkpoint_handler,
         eval_interval=args.eval_interval,
+        skip_validation=args.skip_validation,
+        log_pair_ab_interval=args.log_pair_ab_interval,
+        freeze_pair_scaling_epochs=args.freeze_pair_scaling_epochs,
         start_epoch=start_epoch,
         max_num_epochs=args.max_num_epochs,
+        max_num_steps=args.max_num_steps,
         logger=logger,
         patience=args.patience,
         output_args=output_args,
@@ -434,14 +846,29 @@ def main() -> None:
         ema=ema,
         max_grad_norm=args.clip_grad,
         log_errors=args.error_table,
-        log_wandb=args.wandb,
+        log_wandb=args.wandb and is_rank_zero,
+        distributed=distributed,
+        rank=rank,
     )
 
+    tools.barrier_if_distributed()
+
     # Evaluation on test datasets
+    if args.skip_final_evaluation:
+        if is_rank_zero:
+            logging.info("Skipping final train/valid/test evaluation")
+            logging.info("Done")
+        tools.destroy_process_group_if_initialized()
+        return
+
+    if not is_rank_zero:
+        tools.destroy_process_group_if_initialized()
+        return
+
     logging.info("Computing metrics for training, validation, and test sets")
 
     all_collections = [
-        ("train", collections.train),
+        ("train", train_eval_loader if args.stream_train else collections.train),
         ("valid", collections.valid),
     ] + collections.tests
 
@@ -451,10 +878,11 @@ def main() -> None:
             swa=swa_eval,
             device=device,
         )
-        model.to(device)
+        eval_model = tools.unwrap_model(model)
+        eval_model.to(device)
         logging.info(f"Loaded model from epoch {epoch}")
 
-        for param in model.parameters():
+        for param in eval_model.parameters():
             param.requires_grad = False
         table = create_error_table(
             table_type=args.error_table,
@@ -462,7 +890,7 @@ def main() -> None:
             z_table=z_table,
             r_max=args.r_max,
             valid_batch_size=args.valid_batch_size,
-            model=model,
+            model=eval_model,
             loss_fn=loss_fn,
             output_args=output_args,
             log_wandb=args.wandb,
@@ -477,15 +905,16 @@ def main() -> None:
             model_path = Path(args.checkpoints_dir) / (tag + ".model")
         logging.info(f"Saving model to {model_path}")
         if args.save_cpu:
-            model = model.to("cpu")
-        torch.save(model, model_path)
+            eval_model = eval_model.to("cpu")
+        torch.save(eval_model, model_path)
 
         if swa_eval:
-            torch.save(model, Path(args.model_dir) / (args.name + "_swa.model"))
+            torch.save(eval_model, Path(args.model_dir) / (args.name + "_swa.model"))
         else:
-            torch.save(model, Path(args.model_dir) / (args.name + ".model"))
+            torch.save(eval_model, Path(args.model_dir) / (args.name + ".model"))
 
     logging.info("Done")
+    tools.destroy_process_group_if_initialized()
 
 
 if __name__ == "__main__":

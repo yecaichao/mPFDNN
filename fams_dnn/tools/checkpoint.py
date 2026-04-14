@@ -12,7 +12,7 @@ from typing import Dict, List, Optional, Tuple
 
 import torch
 
-from .torch_tools import TensorDict
+from .torch_tools import TensorDict, unwrap_model
 
 Checkpoint = Dict[str, TensorDict]
 
@@ -27,8 +27,9 @@ class CheckpointState:
 class CheckpointBuilder:
     @staticmethod
     def create_checkpoint(state: CheckpointState) -> Checkpoint:
+        model = unwrap_model(state.model)
         return {
-            "model": state.model.state_dict(),
+            "model": model.state_dict(),
             "optimizer": state.optimizer.state_dict(),
             "lr_scheduler": state.lr_scheduler.state_dict(),
         }
@@ -37,7 +38,8 @@ class CheckpointBuilder:
     def load_checkpoint(
         state: CheckpointState, checkpoint: Checkpoint, strict: bool
     ) -> None:
-        state.model.load_state_dict(checkpoint["model"], strict=strict)  # type: ignore
+        model = unwrap_model(state.model)
+        model.load_state_dict(checkpoint["model"], strict=strict)  # type: ignore
         state.optimizer.load_state_dict(checkpoint["optimizer"])
         state.lr_scheduler.load_state_dict(checkpoint["lr_scheduler"])
 

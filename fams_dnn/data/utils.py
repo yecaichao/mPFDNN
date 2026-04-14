@@ -51,6 +51,23 @@ class Configuration:
 Configurations = List[Configuration]
 
 
+def _to_3x3_matrix(array: np.ndarray) -> np.ndarray:
+    array = np.asarray(array)
+    if array.shape == (3, 3):
+        return array
+    if array.shape == (6,):
+        return np.array(
+            [
+                [array[0], array[5], array[4]],
+                [array[5], array[1], array[3]],
+                [array[4], array[3], array[2]],
+            ]
+        )
+    if array.shape == (9,):
+        return array.reshape(3, 3)
+    raise ValueError(f"Unsupported tensor shape: {array.shape}")
+
+
 def random_train_valid_split(
     items: Sequence, valid_fraction: float, seed: int
 ) -> Tuple[List, List]:
@@ -134,6 +151,16 @@ def config_from_atoms(
     forces_weight = atoms.info.get("config_forces_weight", 1.0)
     stress_weight = atoms.info.get("config_stress_weight", 1.0)
     virials_weight = atoms.info.get("config_virials_weight", 1.0)
+
+    volume = np.dot(cell[0], np.cross(cell[1], cell[2]))
+    if stress is None and virials is not None and abs(volume) > 0.0:
+        virials = _to_3x3_matrix(virials)
+        stress = -virials / volume
+        stress_weight = virials_weight
+    if virials is None and stress is not None and abs(volume) > 0.0:
+        stress = _to_3x3_matrix(stress)
+        virials = -stress * volume
+        virials_weight = stress_weight
 
     # fill in missing quantities but set their weight to 0.0
     if energy is None:
@@ -267,3 +294,64 @@ def compute_average_E0s(
         for i, z in enumerate(z_table.zs):
             atomic_energies_dict[z] = 0.0
     return atomic_energies_dict
+
+
+def compute_reference_E0s(
+    file_path: str,
+    z_table: AtomicNumberTable,
+    energy_key: str = "energy",
+    forces_key: str = "forces",
+    stress_key: str = "stress",
+    virials_key: str = "virials",
+    dipole_key: str = "dipole",
+    charges_key: str = "charges",
+    config_type_weights: Optional[Dict[str, float]] = None,
+) -> Dict[int, float]:
+    if config_type_weights is None:
+        config_type_weights = DEFAULT_CONFIG_TYPE_WEIGHTS
+    _, reference_configs = load_from_xyz(
+        file_path=file_path,
+        config_type_weights=config_type_weights,
+        energy_key=energy_key,
+        forces_key=forces_key,
+        stress_key=stress_key,
+        virials_key=virials_key,
+        dipole_key=dipole_key,
+        charges_key=charges_key,
+        extract_atomic_energies=False,
+    )
+    logging.info(
+        "Loaded %d reference configurations from '%s' for manual E0 initialization",
+        len(reference_configs),
+        file_path,
+    )
+    return compute_average_E0s(reference_configs, z_table)
+
+
+def normalize_atomic_energies_dict(
+    atomic_energies_source: Dict,
+    z_table: AtomicNumberTable,
+) -> Dict[int, float]:
+    normalized = {}
+    for key, value in atomic_energies_source.items():
+        if isinstance(key, str):
+            key_clean = key.strip()
+            if key_clean.isdigit():
+                z = int(key_clean)
+            else:
+                if key_clean not in ase.data.atomic_numbers:
+                    raise ValueError(f"Unknown element symbol '{key}' in E0s")
+                z = ase.data.atomic_numbers[key_clean]
+        elif isinstance(key, (int, np.integer)):
+            z = int(key)
+        else:
+            raise ValueError(f"Unsupported E0 key type: {type(key)}")
+
+        normalized[z] = float(value)
+
+    missing = [z for z in z_table.zs if z not in normalized]
+    if missing:
+        raise ValueError(
+            f"E0s is missing entries for atomic numbers: {missing}"
+        )
+    return normalized

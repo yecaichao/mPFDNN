@@ -1,0 +1,65 @@
+#!/bin/bash
+#BSUB -J hyx_ecl16_r1_p33_ddp2
+#BSUB -q gpu-phy-zhangwq
+#BSUB -n 2
+#BSUB -e %J.err
+#BSUB -o %J.out
+#BSUB -gpu "num=2/host"
+
+set -euo pipefail
+
+cd "$LS_SUBCWD"
+
+export PYTHONUNBUFFERED=1
+export PYTHONPATH="/work/phy-weigw/mPFDNN-opt-v2-radial-l-cg${PYTHONPATH:+:$PYTHONPATH}"
+export OMP_NUM_THREADS=1
+
+PYTHON_BIN="/work/phy-weigw/mPFDNN/env/bin/python"
+
+unzip -q -o dataset.zip
+
+$PYTHON_BIN -m torch.distributed.run \
+    --standalone \
+    --nnodes=1 \
+    --nproc_per_node=2 \
+    -m ptagnn.cli.my_run_train \
+    --gate=None \
+    --device="cuda" \
+    --train_file=dataset/train_data0.xyz \
+    --test_file=dataset/test_data0.xyz \
+    --valid_file=dataset/valid_data0.xyz \
+    --name=paircheby_element_channel_l_120_c16_r1_p33_newscale_ddp2 \
+    --E0s="average" \
+    --loss='universal' \
+    --energy_weight=1 \
+    --forces_weight=10 \
+    --energy_key="energy" \
+    --forces_key="forces" \
+    --eval_interval=1 \
+    --virials_weight=100 \
+    --virials_key='virial' \
+    --model="FAMS_DNN" \
+    --interaction_first="Residual_InteractionBlock" \
+    --interaction="Residual_InteractionBlock" \
+    --radial_type="pairwise_tanh_chebyshev" \
+    --pair_scaling="element_channel_l" \
+    --radial_with_l \
+    --freeze_pair_scaling_epochs=20 \
+    --num_recursions=1 \
+    --product='[3,3]' \
+    --max_ell=3 \
+    --r_max=6.0 \
+    --max_L=0 \
+    --num_channels=16 \
+    --num_radial_basis=10 \
+    --MLP_irreps="16x0e" \
+    --scaling='rms_forces_scaling' \
+    --num_workers=0 \
+    --lr=0.005 \
+    --weight_decay=1e-8 \
+    --ema \
+    --ema_decay=0.995 \
+    --scheduler_patience=5 \
+    --batch_size=16 \
+    --valid_batch_size=16 \
+    --max_num_epochs=120

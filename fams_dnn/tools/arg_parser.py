@@ -93,13 +93,45 @@ def build_default_arg_parser() -> argparse.ArgumentParser:
         help="type of radial basis functions",
         type=str,
         default="bessel",
-        choices=["bessel", "gaussian","chebyshev"],
+        choices=["bessel", "gaussian", "chebyshev", "pairwise_tanh_chebyshev"],
     )
     parser.add_argument(
         "--num_radial_basis",
         help="number of radial basis functions",
         type=int,
         default=8,
+    )
+    parser.add_argument(
+        "--pair_scaling",
+        help="pairwise scaling mode for pairwise_tanh_chebyshev radial basis",
+        type=str,
+        default="element_channel",
+        choices=["none", "element", "element_channel", "element_l", "element_channel_l"],
+    )
+    parser.add_argument(
+        "--radial_with_l",
+        help="expand radial features with explicit l-dependent channels",
+        action="store_true",
+        default=False,
+    )
+    parser.add_argument(
+        "--radial_version",
+        help="radial-edge coupling implementation version",
+        type=str,
+        default="v2",
+        choices=["v1", "v2"],
+    )
+    parser.add_argument(
+        "--activation_checkpoint",
+        help="enable activation checkpointing across interaction blocks during training",
+        action="store_true",
+        default=False,
+    )
+    parser.add_argument(
+        "--use_self_connection",
+        help="enable self-connection / skip path in interaction-product blocks",
+        default=True,
+        type=str2bool,
     )
     parser.add_argument(
         "--num_cutoff_basis",
@@ -211,10 +243,29 @@ def build_default_arg_parser() -> argparse.ArgumentParser:
         type=bool,
         default=True,
     )
+    parser.add_argument(
+        "--virials_impl",
+        help="implementation used for virials/stress outputs",
+        type=str,
+        default="atomic",
+        choices=["atomic", "displacement"],
+    )
 
     # Dataset
     parser.add_argument(
         "--train_file", help="Training set xyz file", type=str, required=True
+    )
+    parser.add_argument(
+        "--stream_train",
+        help="stream the training xyz instead of loading the whole training set into memory; requires --valid_file",
+        action="store_true",
+        default=False,
+    )
+    parser.add_argument(
+        "--stream_shuffle_buffer_size",
+        help="approximate shuffle buffer size for streamed training data; 0 disables buffer shuffling",
+        type=int,
+        default=1024,
     )
     parser.add_argument(
         "--valid_file",
@@ -237,7 +288,14 @@ def build_default_arg_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--E0s",
-        help="Dictionary of isolated atom energies",
+        help="Atomic energy initialization: explicit dictionary string with atomic numbers or element symbols, 'average', or 'reference'",
+        type=str,
+        default=None,
+        required=False,
+    )
+    parser.add_argument(
+        "--E0s_reference_file",
+        help="Reference-state XYZ file used when --E0s=reference",
         type=str,
         default=None,
         required=False,
@@ -298,7 +356,7 @@ def build_default_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--loss",
         help="type of loss",
-        default="weighted",
+        default="universal",
         choices=[
             "ef",
             "weighted",
@@ -384,6 +442,12 @@ def build_default_arg_parser() -> argparse.ArgumentParser:
         "--lr", help="Learning rate of optimizer", type=float, default=0.01
     )
     parser.add_argument(
+        "--pair_scaling_lr",
+        help="learning rate override for pair-scaling parameters a_raw/b_raw; defaults to 5x --lr",
+        type=float,
+        default=None,
+    )
+    parser.add_argument(
         "--swa_lr", help="Learning rate of optimizer in swa", type=float, default=1e-3
     )
     parser.add_argument(
@@ -438,6 +502,12 @@ def build_default_arg_parser() -> argparse.ArgumentParser:
         "--max_num_epochs", help="Maximum number of epochs", type=int, default=2048
     )
     parser.add_argument(
+        "--max_num_steps",
+        help="Maximum number of optimizer steps; if set, training can stop mid-epoch",
+        type=int,
+        default=None,
+    )
+    parser.add_argument(
         "--patience",
         help="Maximum number of consecutive epochs of increasing loss",
         type=int,
@@ -445,6 +515,24 @@ def build_default_arg_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--eval_interval", help="evaluate model every <n> epochs", type=int, default=2
+    )
+    parser.add_argument(
+        "--skip_validation",
+        help="skip validation passes during training",
+        action="store_true",
+        default=False,
+    )
+    parser.add_argument(
+        "--log_pair_ab_interval",
+        help="log pairwise radial a/b statistics every <n> optimizer steps; 0 disables logging",
+        type=int,
+        default=0,
+    )
+    parser.add_argument(
+        "--freeze_pair_scaling_epochs",
+        help="freeze pair-scaling parameters (a_raw/b_raw) for the first <n> epochs",
+        type=int,
+        default=20,
     )
     parser.add_argument(
         "--keep_checkpoints",
@@ -461,6 +549,12 @@ def build_default_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--save_cpu",
         help="Save a model to be loaded on cpu",
+        action="store_true",
+        default=False,
+    )
+    parser.add_argument(
+        "--skip_final_evaluation",
+        help="skip the final train/valid/test evaluation pass after training",
         action="store_true",
         default=False,
     )
@@ -525,6 +619,18 @@ def build_default_arg_parser() -> argparse.ArgumentParser:
         help="Pin memory for data loading",
         default=True,
         type=str2bool,
+    )
+    parser.add_argument(
+        "--persistent_workers",
+        help="Keep DataLoader workers alive between epochs when num_workers > 0",
+        default=True,
+        type=str2bool,
+    )
+    parser.add_argument(
+        "--prefetch_factor",
+        help="Number of batches prefetched by each worker when num_workers > 0",
+        type=int,
+        default=2,
     )
     return parser
 

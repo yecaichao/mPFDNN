@@ -5,10 +5,12 @@
 ###########################################################################################
 
 import logging
+import os
 from typing import Dict
 
 import numpy as np
 import torch
+import torch.distributed as dist
 from e3nn.io import CartesianTensor
 
 TensorDict = Dict[str, torch.Tensor]
@@ -66,6 +68,79 @@ def init_device(device_str: str) -> torch.device:
 
     logging.info("Using CPU")
     return torch.device("cpu")
+
+
+def is_distributed_env() -> bool:
+    return int(os.environ.get("WORLD_SIZE", "1")) > 1
+
+
+def get_rank() -> int:
+    return int(os.environ.get("RANK", "0"))
+
+
+def get_world_size() -> int:
+    return int(os.environ.get("WORLD_SIZE", "1"))
+
+
+def get_local_rank() -> int:
+    return int(os.environ.get("LOCAL_RANK", "0"))
+
+
+def is_rank_zero() -> bool:
+    return get_rank() == 0
+
+
+def init_distributed_if_needed(device_str: str) -> torch.device:
+    if not is_distributed_env():
+        return init_device(device_str)
+
+    if "cuda" in device_str:
+        assert torch.cuda.is_available(), "No CUDA device available!"
+        local_rank = get_local_rank()
+        assert local_rank < torch.cuda.device_count()
+        torch.cuda.set_device(local_rank)
+        device = torch.device(f"cuda:{local_rank}")
+        backend = "nccl"
+    else:
+        device = torch.device(device_str)
+        backend = "gloo"
+
+    if not dist.is_initialized():
+        dist.init_process_group(backend=backend)
+
+    logging.info(
+        "Initialized distributed training: rank=%d world_size=%d local_rank=%d backend=%s",
+        get_rank(),
+        get_world_size(),
+        get_local_rank(),
+        backend,
+    )
+    return device
+
+
+def barrier_if_distributed() -> None:
+    if dist.is_initialized():
+        dist.barrier()
+
+
+def broadcast_object(value, src: int = 0):
+    if not dist.is_initialized():
+        return value
+    object_list = [value if get_rank() == src else None]
+    dist.broadcast_object_list(object_list, src=src)
+    return object_list[0]
+
+
+def unwrap_model(module: torch.nn.Module) -> torch.nn.Module:
+    current = module
+    while hasattr(current, "module"):
+        current = current.module
+    return current
+
+
+def destroy_process_group_if_initialized() -> None:
+    if dist.is_initialized():
+        dist.destroy_process_group()
 
 
 dtype_dict = {"float32": torch.float32, "float64": torch.float64}

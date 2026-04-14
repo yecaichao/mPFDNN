@@ -10,6 +10,7 @@ import numpy as np
 import torch
 from e3nn import o3
 from e3nn.util.jit import compile_mode
+from torch.utils.checkpoint import checkpoint as activation_checkpoint
 
 from ptagnn.data import AtomicData
 from ptagnn.tools.scatter import scatter_sum
@@ -25,6 +26,7 @@ from .myblocks import (
     ScaleShiftBlock,
 )
 from .utils import (
+    compute_atomic_virials as compute_atomic_virials_from_edges,
     compute_fixed_charge_dipole,
     compute_forces,
     get_edge_vectors_and_lengths,
@@ -58,6 +60,11 @@ class FAMS_DNN(torch.nn.Module):
         atomic_inter_shift: float,
         radial_MLP: Optional[List[int]] = None,
         radial_type: Optional[str] = "bessel",
+        pair_scaling: str = "element_channel",
+        radial_with_l: bool = False,
+        radial_version: str = "v1",
+        activation_checkpointing: bool = False,
+        use_self_connection: bool = True,
         **kwargs,
     ):
         super().__init__()
@@ -71,8 +78,12 @@ class FAMS_DNN(torch.nn.Module):
             "num_interactions", torch.tensor(num_interactions, dtype=torch.int64)
         )
         self.scale_shift = ScaleShiftBlock(
-            scale=atomic_inter_scale, shift=atomic_inter_shift
+            scale=1.0,
+            shift=0.0,
+            num_elements=num_elements,
+            trainable_element_scales=True,
         )
+        self.activation_checkpointing = activation_checkpointing
 
         if isinstance(correlation, int):
             correlation = [correlation] * num_interactions
@@ -81,8 +92,9 @@ class FAMS_DNN(torch.nn.Module):
         ## Embedding part
         ###  make ZI
         zi = o3.Irreps([(num_elements, (0, 1))])
+        num_features = hidden_irreps.count(o3.Irrep(0, 1))
         ### ir MLP(ZI)
-        mlp_zi = o3.Irreps([(hidden_irreps.count(o3.Irrep(0, 1)), (0, 1))])
+        mlp_zi = o3.Irreps([(num_features, (0, 1))])
         self.node_embedding = LinearNodeEmbeddingBlock(
             irreps_in=zi, irreps_out=mlp_zi
         )
@@ -92,13 +104,17 @@ class FAMS_DNN(torch.nn.Module):
             num_bessel=num_bessel,
             num_polynomial_cutoff=num_polynomial_cutoff,
             radial_type=radial_type,
+            num_elements=num_elements,
+            num_pair_channels=num_features,
+            pair_scaling=pair_scaling,
+            radial_with_l=radial_with_l,
+            radial_version=radial_version,
+            max_ell=max_ell,
         )
         edge_feats_irreps = o3.Irreps(f"{self.radial_embedding.out_dim}x0e")
 
         ### make lm for
         sh_irreps = o3.Irreps.spherical_harmonics(max_ell)
-        ### get outnumber of MLP(ZI)
-        num_features = hidden_irreps.count(o3.Irrep(0, 1))
         ### set LM for Rn() otime Y_lm()
         interaction_irreps = (sh_irreps * num_features).sort()[0].simplify()
         ### make Y_lm()
@@ -120,11 +136,12 @@ class FAMS_DNN(torch.nn.Module):
             hidden_irreps=hidden_irreps,
             avg_num_neighbors=avg_num_neighbors,
             radial_MLP=radial_MLP,
+            radial_version=radial_version,
+            use_self_connection=use_self_connection,
         )
         self.interactions = torch.nn.ModuleList([inter])
 
-        # Use the appropriate self connection at the first layer for proper E0
-        use_sc_first = True
+        use_sc_first = use_self_connection
 
         ### get out for linear basis
         linear_basis_out=inter.target_irreps
@@ -157,6 +174,8 @@ class FAMS_DNN(torch.nn.Module):
                 hidden_irreps=hidden_irreps_out,
                 avg_num_neighbors=avg_num_neighbors,
                 radial_MLP=radial_MLP,
+                radial_version=radial_version,
+                use_self_connection=use_self_connection,
             )
             self.interactions.append(inter)
             ### make otime for gnn
@@ -165,15 +184,10 @@ class FAMS_DNN(torch.nn.Module):
                 target_irreps=hidden_irreps_out,
                 correlation=correlation[i + 1],
                 num_elements=num_elements,
-                use_sc=True,
+                use_sc=use_self_connection,
             )
             self.products.append(prod)
-            if i == num_interactions - 2:
-                self.readouts.append(
-                    NonLinearReadoutBlock(hidden_irreps_out, MLP_irreps, gate)
-                )
-            else:
-                self.readouts.append(LinearReadoutBlock(hidden_irreps))
+            self.readouts.append(LinearReadoutBlock(o3.Irreps(hidden_irreps_out)))
 
     def forward(
             self,
@@ -183,17 +197,22 @@ class FAMS_DNN(torch.nn.Module):
             compute_virials: bool = False,
             compute_stress: bool = False,
             compute_displacement: bool = False,
+            compute_atomic_virials: bool = False,
+            atomic_virials_chunk_size: int = 16,
+            virials_impl: str = "atomic",
     ) -> Dict[str, Optional[torch.Tensor]]:
         # Setup
         data["positions"].requires_grad_(True)
-        data["node_attrs"].requires_grad_(True)
         num_graphs = data["ptr"].numel() - 1
         displacement = torch.zeros(
             (num_graphs, 3, 3),
             dtype=data["positions"].dtype,
             device=data["positions"].device,
         )
-        if compute_virials or compute_stress or compute_displacement:
+        needs_displacement = compute_displacement or (
+            virials_impl == "displacement" and (compute_virials or compute_stress)
+        )
+        if needs_displacement:
             (
                 data["positions"],
                 data["shifts"],
@@ -215,41 +234,97 @@ class FAMS_DNN(torch.nn.Module):
 
         # Embeddings
         node_feats = self.node_embedding(data["node_attrs"])
+        sender = data["edge_index"][0]
+        receiver = data["edge_index"][1]
+        node_has_neighbors = torch.zeros(
+            data["positions"].shape[0],
+            dtype=data["positions"].dtype,
+            device=data["positions"].device,
+        )
+        if receiver.numel() > 0:
+            node_has_neighbors.scatter_add_(
+                0,
+                receiver,
+                torch.ones_like(receiver, dtype=data["positions"].dtype),
+            )
+        node_has_neighbors = (node_has_neighbors > 0).to(data["positions"].dtype)
         vectors, lengths = get_edge_vectors_and_lengths(
             positions=data["positions"],
             edge_index=data["edge_index"],
             shifts=data["shifts"],
         )
         edge_attrs = self.spherical_harmonics(vectors)
-        edge_feats = self.radial_embedding(lengths)
+        edge_feats = self.radial_embedding(
+            lengths,
+            sender_attrs=data["node_attrs"][sender],
+            receiver_attrs=data["node_attrs"][receiver],
+        )
 
         # Interactions
-        node_es_list = []
-        node_feats_list = []
-        node_es_basis_inter = []
+        collect_node_feats = not training
+        node_feats_list = [] if collect_node_feats else None
+        node_inter_es = None
         for interaction, product, readout in zip(
                 self.interactions, self.products, self.readouts
         ):
-            node_feats, sc = interaction(
-                node_attrs=data["node_attrs"],
-                node_feats=node_feats,
-                edge_attrs=edge_attrs,
-                edge_feats=edge_feats,
-                edge_index=data["edge_index"],
-            )
-            node_feats = product(
-                node_feats=node_feats, sc=sc, node_attrs=data["node_attrs"])#, mji=None, receiver=None)
-            node_feats_list.append(node_feats)
-            node_es_list.append(readout(node_feats).squeeze(-1))  # {[n_nodes, ], }
+            if training and self.activation_checkpointing:
+                def interaction_forward(
+                    node_feats_in: torch.Tensor,
+                    node_attrs_in: torch.Tensor,
+                    edge_attrs_in: torch.Tensor,
+                    edge_feats_in: torch.Tensor,
+                    edge_index_in: torch.Tensor,
+                ):
+                    return interaction(
+                        node_attrs=node_attrs_in,
+                        node_feats=node_feats_in,
+                        edge_attrs=edge_attrs_in,
+                        edge_feats=edge_feats_in,
+                        edge_index=edge_index_in,
+                    )
 
-        # Concatenate node features
-        node_feats_out = torch.cat(node_feats_list, dim=-1)
+                node_feats, sc = activation_checkpoint(
+                    interaction_forward,
+                    node_feats,
+                    data["node_attrs"],
+                    edge_attrs,
+                    edge_feats,
+                    data["edge_index"],
+                    use_reentrant=False,
+                )
+                node_feats = product(
+                    node_feats=node_feats,
+                    sc=sc,
+                    node_attrs=data["node_attrs"],
+                )
+                node_mask = node_has_neighbors.view(
+                    -1, *([1] * (node_feats.dim() - 1))
+                )
+                node_feats = node_feats * node_mask
+                current_node_es = readout(node_feats).squeeze(-1)
+            else:
+                node_feats, sc = interaction(
+                    node_attrs=data["node_attrs"],
+                    node_feats=node_feats,
+                    edge_attrs=edge_attrs,
+                    edge_feats=edge_feats,
+                    edge_index=data["edge_index"],
+                )
+                node_feats = product(
+                    node_feats=node_feats,
+                    sc=sc,
+                    node_attrs=data["node_attrs"],
+                )
+                node_mask = node_has_neighbors.view(
+                    -1, *([1] * (node_feats.dim() - 1))
+                )
+                node_feats = node_feats * node_mask
+                current_node_es = readout(node_feats).squeeze(-1)
+            if collect_node_feats:
+                node_feats_list.append(node_feats)
+            node_inter_es = current_node_es if node_inter_es is None else node_inter_es + current_node_es
 
-        # Sum over interactions
-        node_inter_es = torch.sum(
-            torch.stack(node_es_list, dim=0), dim=0
-        )  # [n_nodes, ]
-        node_inter_es = self.scale_shift(node_inter_es)
+        node_inter_es = self.scale_shift(node_inter_es, data["node_attrs"])
 
         # Sum over nodes in graph
         inter_e = scatter_sum(
@@ -260,28 +335,63 @@ class FAMS_DNN(torch.nn.Module):
         total_energy = e0 + inter_e
         node_energy = node_e0 + node_inter_es
 
+        atomic_virials_out = None
+        needs_atomic_virials = compute_atomic_virials or (
+            virials_impl == "atomic" and (compute_virials or compute_stress)
+        )
+        if needs_atomic_virials:
+            atomic_virials_out = compute_atomic_virials_from_edges(
+                energy=inter_e,
+                edge_vectors=vectors,
+                edge_index=data["edge_index"],
+                batch=data["batch"],
+                cell=data["cell"],
+                training=(
+                    training
+                    or compute_force
+                    or compute_virials
+                    or compute_stress
+                    or compute_atomic_virials
+                ),
+            )
+
         forces, virials, stress = get_outputs(
             energy=inter_e,
             positions=data["positions"],
             displacement=displacement,
             cell=data["cell"],
+            edge_vectors=vectors,
+            edge_index=data["edge_index"],
+            batch=data["batch"],
+            atomic_virials=atomic_virials_out,
             training=training,
             compute_force=compute_force,
             compute_virials=compute_virials,
             compute_stress=compute_stress,
+            virials_impl=virials_impl,
         )
-        output = {
-            "e0": e0,  ## add by shenye
-            "node_e0": node_e0,  ## add by shengye
-            "energy": total_energy,
-            "node_energy": node_energy,
-            "interaction_node_energy": node_inter_es,
-            "interaction_energy": inter_e,
-            "forces": forces,
-            "virials": virials,
-            "stress": stress,
-            "displacement": displacement,
-            "node_feats": node_feats_out,
-        }
+        if training:
+            output = {
+                "energy": total_energy,
+                "forces": forces,
+                "virials": virials,
+                "stress": stress,
+                "atomic_virials": atomic_virials_out,
+            }
+        else:
+            node_feats_out = torch.cat(node_feats_list, dim=-1) if node_feats_list else None
+            output = {
+                "e0": e0,  ## add by shenye
+                "node_e0": node_e0,  ## add by shengye
+                "energy": total_energy,
+                "node_energy": node_energy,
+                "interaction_node_energy": node_inter_es,
+                "interaction_energy": inter_e,
+                "forces": forces,
+                "virials": virials,
+                "stress": stress,
+                "atomic_virials": atomic_virials_out,
+                "displacement": displacement,
+                "node_feats": node_feats_out,
+            }
         return output
-

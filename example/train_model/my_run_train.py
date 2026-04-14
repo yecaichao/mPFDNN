@@ -11,12 +11,10 @@ from pathlib import Path
 from typing import Optional
 
 import numpy as np
-import torch.nn.functional
 from e3nn import o3
 from torch.optim.swa_utils import SWALR, AveragedModel
 from torch_ema import ExponentialMovingAverage
 
-import ptagnn
 from ptagnn import data, modules, tools
 from ptagnn.tools import torch_geometric
 from ptagnn.tools.scripts_utils import (
@@ -108,10 +106,33 @@ def main() -> None:
                     atomic_energies_dict = data.compute_average_E0s(
                         collections.train, z_table
                     )
+                elif args.E0s == "reference":
+                    if args.E0s_reference_file is None:
+                        raise RuntimeError(
+                            "E0s='reference' requires --E0s_reference_file"
+                        )
+                    logging.info(
+                        "Computing atomic energies from manual reference-state file '%s'",
+                        args.E0s_reference_file,
+                    )
+                    atomic_energies_dict = data.compute_reference_E0s(
+                        file_path=args.E0s_reference_file,
+                        z_table=z_table,
+                        energy_key=args.energy_key,
+                        forces_key=args.forces_key,
+                        stress_key=args.stress_key,
+                        virials_key=args.virials_key,
+                        dipole_key=args.dipole_key,
+                        charges_key=args.charges_key,
+                        config_type_weights=config_type_weights,
+                    )
                 else:
                     try:
-                        atomic_energies_dict = ast.literal_eval(args.E0s)
-                        assert isinstance(atomic_energies_dict, dict)
+                        atomic_energies_source = ast.literal_eval(args.E0s)
+                        assert isinstance(atomic_energies_source, dict)
+                        atomic_energies_dict = data.normalize_atomic_energies_dict(
+                            atomic_energies_source, z_table
+                        )
                     except Exception as e:
                         raise RuntimeError(
                             f"E0s specified invalidly, error {e} occurred"
@@ -126,6 +147,13 @@ def main() -> None:
         logging.info(f"Atomic energies: {atomic_energies.tolist()}")
 
     logging.info(f"Reading train file")
+    dataloader_kwargs = dict(
+        pin_memory=args.pin_memory,
+        num_workers=args.num_workers,
+    )
+    if args.num_workers > 0:
+        dataloader_kwargs["persistent_workers"] = args.persistent_workers
+        dataloader_kwargs["prefetch_factor"] = args.prefetch_factor
     train_loader = torch_geometric.dataloader.DataLoader(
         dataset=[
             data.AtomicData.from_config(config, z_table=z_table, cutoff=args.r_max)
@@ -134,8 +162,7 @@ def main() -> None:
         batch_size=args.batch_size,
         shuffle=True,
         drop_last=True,
-        pin_memory=args.pin_memory,
-        num_workers=args.num_workers,
+        **dataloader_kwargs,
     )
     logging.info(f"Reading valid file")
     valid_loader = torch_geometric.dataloader.DataLoader(
@@ -146,8 +173,7 @@ def main() -> None:
         batch_size=args.valid_batch_size,
         shuffle=False,
         drop_last=False,
-        pin_memory=args.pin_memory,
-        num_workers=args.num_workers,
+        **dataloader_kwargs,
     )
 
     loss_fn: torch.nn.Module
@@ -176,6 +202,18 @@ def main() -> None:
             stress_weight=args.stress_weight,
             huber_delta=args.huber_delta,
         )
+    elif args.loss == "universal":
+        loss_fn = modules.UniversalLoss(
+            energy_weight=args.energy_weight,
+            forces_weight=args.forces_weight,
+            stress_weight=args.stress_weight,
+            huber_delta=args.huber_delta,
+        )
+    elif args.loss == "l1l2energyforces":
+        loss_fn = modules.WeightedEnergyForcesL1L2Loss(
+            energy_weight=args.energy_weight,
+            forces_weight=args.forces_weight,
+        )
     elif args.loss == "dipole":
         assert (
             dipole_only is True
@@ -195,16 +233,34 @@ def main() -> None:
         loss_fn = modules.WeightedEnergyForcesLoss(energy_weight=1.0, forces_weight=1.0)
     logging.info(loss_fn)
 
+    has_stress_labels = any(
+        float(config.stress_weight) > 0.0 for config in collections.train
+    )
+    has_virials_labels = any(
+        float(config.virials_weight) > 0.0 for config in collections.train
+    )
+    has_stress_or_virial_labels = has_stress_labels or has_virials_labels
+
     if args.compute_avg_num_neighbors:
         args.avg_num_neighbors = modules.compute_avg_num_neighbors(train_loader)
     logging.info(f"Average number of neighbors: {args.avg_num_neighbors}")
 
     # Selecting outputs
     compute_virials = False
-    if args.loss in ("stress", "virials", "huber"):
-        compute_virials = True
-        args.compute_stress = True
-        args.error_table = "PerAtomRMSEstressvirials"
+    if args.loss in ("stress", "virials", "huber", "universal"):
+        if has_stress_or_virial_labels:
+            compute_virials = True
+            args.compute_stress = True
+            args.error_table = "PerAtomRMSEstressvirials"
+        else:
+            logging.info(
+                "No stress/virial labels found in training data; disabling stress/virial computations for loss=%s",
+                args.loss,
+            )
+            compute_virials = False
+            args.compute_stress = False
+            if args.error_table == "PerAtomRMSEstressvirials":
+                args.error_table = "PerAtomRMSE"
 
     output_args = {
         "energy": compute_energy,
@@ -212,6 +268,7 @@ def main() -> None:
         "virials": compute_virials,
         "stress": args.compute_stress,
         "dipoles": compute_dipole,
+        "virials_impl": args.virials_impl,
     }
     logging.info(f"Selected the following outputs: {output_args}")
 
@@ -247,17 +304,24 @@ def main() -> None:
 
     model: torch.nn.Module
     if args.model == "FAMS_DNN":
-        mean, std = modules.scaling_classes[args.scaling](train_loader, atomic_energies)
+        logging.info(
+            "FAMS_DNN uses trainable element-dependent interaction scales initialized to 1.0 and fixed interaction shift 0.0"
+        )
         model = modules.FAMS_DNN(
             **model_config,
             correlation=args.product,
             gate=modules.gate_dict[args.gate],
             make_linear_basis=modules.interaction_classes[args.interaction_first],
             MLP_irreps=o3.Irreps(args.MLP_irreps),
-            atomic_inter_scale=std,
-            atomic_inter_shift=mean,
+            atomic_inter_scale=1.0,
+            atomic_inter_shift=0.0,
             radial_MLP=ast.literal_eval(args.radial_MLP),
             radial_type=args.radial_type,
+            pair_scaling=args.pair_scaling,
+            radial_with_l=args.radial_with_l,
+            radial_version=args.radial_version,
+            activation_checkpointing=args.activation_checkpoint,
+            use_self_connection=args.use_self_connection,
         )
     else:
         raise RuntimeError(f"Unknown model: '{args.model}'")
@@ -277,6 +341,16 @@ def main() -> None:
             {
                 "name": "embedding",
                 "params": model.node_embedding.parameters(),
+                "weight_decay": 0.0,
+            },
+            {
+                "name": "radial_embedding",
+                "params": model.radial_embedding.parameters(),
+                "weight_decay": 0.0,
+            },
+            {
+                "name": "scale_shift",
+                "params": model.scale_shift.parameters(),
                 "weight_decay": 0.0,
             },
             {
@@ -336,6 +410,18 @@ def main() -> None:
                 energy_weight=args.swa_energy_weight,
                 forces_weight=args.swa_forces_weight,
                 stress_weight=args.swa_stress_weight,
+            )
+        elif args.loss == "universal":
+            loss_fn_energy = modules.UniversalLoss(
+                energy_weight=args.swa_energy_weight,
+                forces_weight=args.swa_forces_weight,
+                stress_weight=args.swa_stress_weight,
+                huber_delta=args.huber_delta,
+            )
+        elif args.loss == "l1l2energyforces":
+            loss_fn_energy = modules.WeightedEnergyForcesL1L2Loss(
+                energy_weight=args.swa_energy_weight,
+                forces_weight=args.swa_forces_weight,
             )
         elif args.loss == "energy_forces_dipole":
             loss_fn_energy = modules.WeightedEnergyForcesDipoleLoss(
@@ -424,8 +510,12 @@ def main() -> None:
         lr_scheduler=lr_scheduler,
         checkpoint_handler=checkpoint_handler,
         eval_interval=args.eval_interval,
+        skip_validation=args.skip_validation,
+        log_pair_ab_interval=args.log_pair_ab_interval,
+        freeze_pair_scaling_epochs=args.freeze_pair_scaling_epochs,
         start_epoch=start_epoch,
         max_num_epochs=args.max_num_epochs,
+        max_num_steps=args.max_num_steps,
         logger=logger,
         patience=args.patience,
         output_args=output_args,
@@ -438,6 +528,11 @@ def main() -> None:
     )
 
     # Evaluation on test datasets
+    if args.skip_final_evaluation:
+        logging.info("Skipping final train/valid/test evaluation")
+        logging.info("Done")
+        return
+
     logging.info("Computing metrics for training, validation, and test sets")
 
     all_collections = [
