@@ -7,7 +7,7 @@ from ptagnn.tools.scatter import scatter_sum
 
 
 @compile_mode("script")
-class LAMMPS_MACE(torch.nn.Module):
+class LAMMPS_MPF(torch.nn.Module):
     def __init__(self, model):
         super().__init__()
         self.model = model

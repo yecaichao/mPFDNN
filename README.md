@@ -35,6 +35,7 @@ Compared with the original public branch, the current codebase includes:
 ## Current FAMS_DNN Behavior
 
 - The recommended training entrypoint is `python -m ptagnn.cli.my_run_train`.
+- This branch is intentionally focused on `FAMS_DNN`; legacy non-FAMS model families and their dedicated training paths have been removed.
 - `radial_version` defaults to `v2`.
 - `loss` defaults to `universal`.
 - `freeze_pair_scaling_epochs` defaults to `20`.
@@ -122,7 +123,6 @@ Optional fields:
 
 - `stress`
 - `virial` or `virials`
-- `dipole`
 - `charges`
 - `config_type`
 - `config_weight`

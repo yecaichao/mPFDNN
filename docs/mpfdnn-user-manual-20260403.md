@@ -96,7 +96,6 @@ Supported training files are ASE-readable extended XYZ files.
 
 - `stress`
 - `virial` or `virials`
-- `dipole`
 - `charges`
 - `config_type`
 - `config_weight`
@@ -295,15 +294,13 @@ Current radial pair-scaling initialization for `pairwise_tanh_chebyshev`:
   Default: `energy`
 - `--forces_key`
   Default: `forces`
-- `--dipole_key`
-  Default: `dipole`
 - `--charges_key`
   Default: `charges`
 
 ### Loss selection
 
 - `--loss`
-  `ef | weighted | forces_only | virials | stress | dipole | huber | universal | energy_forces_dipole | l1l2energyforces`
+  `ef | weighted | forces_only | virials | stress | huber | universal | l1l2energyforces`
   Current default: `universal`
 
 Current practical meaning:
@@ -329,7 +326,6 @@ Current practical meaning:
 - `--energy_weight`
 - `--virials_weight`
 - `--stress_weight`
-- `--dipole_weight`
 - `--config_type_weights`
 - `--huber_delta`
 
@@ -339,7 +335,6 @@ SWA counterparts:
 - `--swa_energy_weight`
 - `--swa_virials_weight`
 - `--swa_stress_weight`
-- `--swa_dipole_weight`
 
 ### Optimizer and schedule
 

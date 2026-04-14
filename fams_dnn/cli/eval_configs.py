@@ -43,7 +43,7 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--return_contributions",
-        help="model outputs energy contributions for each body order, only supported for MACE, not ScaleShiftMACE",
+        help="return per-body-order contributions when the loaded model exposes them",
         action="store_true",
         default=False,
     )
@@ -51,7 +51,7 @@ def parse_args() -> argparse.Namespace:
         "--info_prefix",
         help="prefix for energy, forces and stress keys",
         type=str,
-        default="MACE_",
+        default="MODEL_",
     )
     return parser.parse_args()
 

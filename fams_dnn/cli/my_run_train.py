@@ -1,5 +1,5 @@
 ###########################################################################################
-# Training script for MACE
+# Training script for FAMS_DNN
 # Authors: Ilyes Batatia, Gregor Simm, David Kovacs
 # This program is distributed under the MIT License (see MIT.md)
 ###########################################################################################
@@ -208,96 +208,79 @@ def main() -> None:
 
     z_table = tools.get_atomic_number_table_from_zs(z_sources)
     logging.info(z_table)
-    if args.model == "AtomicDipolesMACE":
-        atomic_energies = None
-        dipole_only = True
-        compute_dipole = True
-        compute_energy = False
-        args.compute_forces = False
-        compute_virials = False
-        args.compute_stress = False
-    else:
-        dipole_only = False
-        if args.model == "EnergyDipolesMACE":
-            compute_dipole = True
-            compute_energy = True
-            args.compute_forces = True
-            compute_virials = False
-            args.compute_stress = False
-        else:
-            compute_energy = True
-            compute_dipole = False
-        if atomic_energies_dict is None or len(atomic_energies_dict) == 0:
-            if args.E0s is not None:
-                logging.info(
-                    "Atomic Energies not in training file, using command line argument E0s"
-                )
-                if args.E0s == "average":
-                    if args.stream_train:
-                        if is_rank_zero:
-                            if len(collections.valid) == 0:
-                                raise RuntimeError(
-                                    "E0s='average' with --stream_train requires a non-empty validation set"
-                                )
-                            logging.info(
-                                "Computing average Atomic Energies from the validation set during streamed training"
+    compute_energy = True
+    compute_dipole = False
+    if atomic_energies_dict is None or len(atomic_energies_dict) == 0:
+        if args.E0s is not None:
+            logging.info(
+                "Atomic Energies not in training file, using command line argument E0s"
+            )
+            if args.E0s == "average":
+                if args.stream_train:
+                    if is_rank_zero:
+                        if len(collections.valid) == 0:
+                            raise RuntimeError(
+                                "E0s='average' with --stream_train requires a non-empty validation set"
                             )
-                            atomic_energies_dict = data.compute_average_E0s(
-                                collections.valid, z_table
-                            )
-                        else:
-                            atomic_energies_dict = None
-                    else:
                         logging.info(
-                            "Computing average Atomic Energies using least squares regression"
+                            "Computing average Atomic Energies from the validation set during streamed training"
                         )
                         atomic_energies_dict = data.compute_average_E0s(
-                            collections.train, z_table
+                            collections.valid, z_table
                         )
-                elif args.E0s == "reference":
-                    if args.E0s_reference_file is None:
-                        raise RuntimeError(
-                            "E0s='reference' requires --E0s_reference_file"
-                        )
-                    logging.info(
-                        "Computing atomic energies from manual reference-state file '%s'",
-                        args.E0s_reference_file,
-                    )
-                    atomic_energies_dict = data.compute_reference_E0s(
-                        file_path=args.E0s_reference_file,
-                        z_table=z_table,
-                        energy_key=args.energy_key,
-                        forces_key=args.forces_key,
-                        stress_key=args.stress_key,
-                        virials_key=args.virials_key,
-                        dipole_key=args.dipole_key,
-                        charges_key=args.charges_key,
-                        config_type_weights=config_type_weights,
-                    )
+                    else:
+                        atomic_energies_dict = None
                 else:
-                    try:
-                        atomic_energies_source = ast.literal_eval(args.E0s)
-                        assert isinstance(atomic_energies_source, dict)
-                        atomic_energies_dict = data.normalize_atomic_energies_dict(
-                            atomic_energies_source, z_table
-                        )
-                    except Exception as e:
-                        raise RuntimeError(
-                            f"E0s specified invalidly, error {e} occurred"
-                        ) from e
-            else:
-                raise RuntimeError(
-                    "E0s not found in training file and not specified in command line"
+                    logging.info(
+                        "Computing average Atomic Energies using least squares regression"
+                    )
+                    atomic_energies_dict = data.compute_average_E0s(
+                        collections.train, z_table
+                    )
+            elif args.E0s == "reference":
+                if args.E0s_reference_file is None:
+                    raise RuntimeError(
+                        "E0s='reference' requires --E0s_reference_file"
+                    )
+                logging.info(
+                    "Computing atomic energies from manual reference-state file '%s'",
+                    args.E0s_reference_file,
                 )
-        if distributed:
-            atomic_energies_dict = tools.broadcast_object(
-                atomic_energies_dict if is_rank_zero else None,
-                src=0,
+                atomic_energies_dict = data.compute_reference_E0s(
+                    file_path=args.E0s_reference_file,
+                    z_table=z_table,
+                    energy_key=args.energy_key,
+                    forces_key=args.forces_key,
+                    stress_key=args.stress_key,
+                    virials_key=args.virials_key,
+                    dipole_key=args.dipole_key,
+                    charges_key=args.charges_key,
+                    config_type_weights=config_type_weights,
+                )
+            else:
+                try:
+                    atomic_energies_source = ast.literal_eval(args.E0s)
+                    assert isinstance(atomic_energies_source, dict)
+                    atomic_energies_dict = data.normalize_atomic_energies_dict(
+                        atomic_energies_source, z_table
+                    )
+                except Exception as e:
+                    raise RuntimeError(
+                        f"E0s specified invalidly, error {e} occurred"
+                    ) from e
+        else:
+            raise RuntimeError(
+                "E0s not found in training file and not specified in command line"
             )
-        atomic_energies: np.ndarray = np.array(
-            [atomic_energies_dict[z] for z in z_table.zs]
+    if distributed:
+        atomic_energies_dict = tools.broadcast_object(
+            atomic_energies_dict if is_rank_zero else None,
+            src=0,
         )
-        logging.info(f"Atomic energies: {atomic_energies.tolist()}")
+    atomic_energies: np.ndarray = np.array(
+        [atomic_energies_dict[z] for z in z_table.zs]
+    )
+    logging.info(f"Atomic energies: {atomic_energies.tolist()}")
 
     logging.info(f"Reading train file")
     train_dataloader_kwargs = dict(
@@ -457,20 +440,6 @@ def main() -> None:
         loss_fn = modules.WeightedEnergyForcesL1L2Loss(
             energy_weight=args.energy_weight,
             forces_weight=args.forces_weight,
-        )
-    elif args.loss == "dipole":
-        assert (
-            dipole_only is True
-        ), "dipole loss can only be used with AtomicDipolesMACE model"
-        loss_fn = modules.DipoleSingleLoss(
-            dipole_weight=args.dipole_weight,
-        )
-    elif args.loss == "energy_forces_dipole":
-        assert dipole_only is False and compute_dipole is True
-        loss_fn = modules.WeightedEnergyForcesDipoleLoss(
-            energy_weight=args.energy_weight,
-            forces_weight=args.forces_weight,
-            dipole_weight=args.dipole_weight,
         )
     else:
         # Unweighted Energy and Forces loss by default
@@ -713,7 +682,6 @@ def main() -> None:
     swa: Optional[tools.SWAContainer] = None
     swas = [False]
     if args.swa:
-        assert dipole_only is False, "swa for dipole fitting not implemented"
         swas.append(True)
         if args.start_swa is None:
             args.start_swa = (
@@ -744,15 +712,6 @@ def main() -> None:
             loss_fn_energy = modules.WeightedEnergyForcesL1L2Loss(
                 energy_weight=args.swa_energy_weight,
                 forces_weight=args.swa_forces_weight,
-            )
-        elif args.loss == "energy_forces_dipole":
-            loss_fn_energy = modules.WeightedEnergyForcesDipoleLoss(
-                args.swa_energy_weight,
-                forces_weight=args.swa_forces_weight,
-                dipole_weight=args.swa_dipole_weight,
-            )
-            logging.info(
-                f"Using stochastic weight averaging (after {args.start_swa} epochs) with energy weight : {args.swa_energy_weight}, forces weight : {args.swa_forces_weight}, dipole weight : {args.swa_dipole_weight} and learning rate : {args.swa_lr}"
             )
         else:
             loss_fn_energy = modules.WeightedEnergyForcesLoss(

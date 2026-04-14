@@ -1,6 +1,5 @@
 ###########################################################################################
-# Implementation of the symmetric contraction algorithm presented in the MACE paper
-# (Batatia et al, MACE: Higher Order Equivariant Message Passing Neural Networks for Fast and Accurate Force Fields , Eq.10 and 11)
+# Implementation of the symmetric contraction used by the current equivariant model stack
 # Authors: Ilyes Batatia
 # This program is distributed under the MIT License (see MIT.md)
 ###########################################################################################

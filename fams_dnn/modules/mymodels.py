@@ -1,5 +1,5 @@
 ###########################################################################################
-# Implementation of MACE models and other models based E(3)-Equivariant MPNNs
+# Implementation of FAMS_DNN and related E(3)-equivariant message-passing blocks
 # Authors: Ilyes Batatia, Gregor Simm
 # This program is distributed under the MIT License (see MIT.md)
 ###########################################################################################
@@ -27,7 +27,6 @@ from .myblocks import (
 )
 from .utils import (
     compute_atomic_virials as compute_atomic_virials_from_edges,
-    compute_fixed_charge_dipole,
     compute_forces,
     get_edge_vectors_and_lengths,
     get_outputs,

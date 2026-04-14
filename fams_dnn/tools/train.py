@@ -272,26 +272,6 @@ def train(
                         f"RMSE_E={rmse_e:.1f} meV, MAE_E={mae_e:.1f} meV, "
                         f"RMSE_F={rmse_f:.1f} meV / A, MAE_F={mae_f:.1f} meV / A"
                     )
-                elif log_errors == "DipoleRMSE":
-                    rmse_mu = eval_metrics["rmse_mu_per_atom"] * 1e3
-                    mae_mu = eval_metrics["mae_mu_per_atom"] * 1e3
-                    logging.info(
-                        f"Epoch {epoch}: loss={valid_loss:.4f}, "
-                        f"RMSE_MU_per_atom={rmse_mu:.2f} mDebye, MAE_MU_per_atom={mae_mu:.2f} mDebye"
-                    )
-                elif log_errors == "EnergyDipoleRMSE":
-                    rmse_e = eval_metrics["rmse_e_per_atom"] * 1e3
-                    mae_e = eval_metrics["mae_e_per_atom"] * 1e3
-                    rmse_f = eval_metrics["rmse_f"] * 1e3
-                    mae_f = eval_metrics["mae_f"] * 1e3
-                    rmse_mu = eval_metrics["rmse_mu_per_atom"] * 1e3
-                    mae_mu = eval_metrics["mae_mu_per_atom"] * 1e3
-                    logging.info(
-                        f"Epoch {epoch}: loss={valid_loss:.4f}, "
-                        f"RMSE_E_per_atom={rmse_e:.1f} meV, MAE_E_per_atom={mae_e:.1f} meV, "
-                        f"RMSE_F={rmse_f:.1f} meV / A, MAE_F={mae_f:.1f} meV / A, "
-                        f"RMSE_MU_per_atom={rmse_mu:.2f} mDebye, MAE_MU_per_atom={mae_mu:.2f} mDebye"
-                    )
                 if log_wandb and is_rank_zero:
                     wandb_log_dict = {
                         "epoch": epoch,
