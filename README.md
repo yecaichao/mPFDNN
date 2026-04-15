@@ -18,12 +18,7 @@ python setup.py install
 
 ## GPU Conda Environment
 
-The repository has been validated with a dedicated GPU conda environment under a user account.
-
-Validated example:
-
-- environment path: `/work/phy-huangj/.conda/envs/hyx-mpfdnn-gpu`
-- repository path: `/work/phy-huangj/hyx/app-test/hyx-mpfdnn-developer`
+The repository can be used from a dedicated GPU-enabled conda environment.
 
 Recommended setup:
 
@@ -31,23 +26,29 @@ Recommended setup:
 source /etc/profile >/dev/null 2>&1 || true
 source /share/apps/anaconda3/etc/profile.d/conda.sh
 
-conda create -y -p /work/<user>/.conda/envs/hyx-mpfdnn-gpu python=3.10 pip
+conda create -y -p <env-prefix> python=3.10 pip
 
-conda run -p /work/<user>/.conda/envs/hyx-mpfdnn-gpu \
+conda run -p <env-prefix> \
   python -m pip install --upgrade pip
 
-conda run -p /work/<user>/.conda/envs/hyx-mpfdnn-gpu \
+conda run -p <env-prefix> \
   python -m pip install \
   --index-url https://download.pytorch.org/whl/cu121 \
   --extra-index-url https://pypi.tuna.tsinghua.edu.cn/simple \
-  -r /path/to/mPFDNN/requirements.txt
+  -r <repo-root>/requirements.txt
 ```
 
 To make `ptagnn` importable without mutating the source tree, register the repo path with a `.pth` file:
 
 ```bash
-printf '%s\n' /path/to/mPFDNN \
-  > /work/<user>/.conda/envs/hyx-mpfdnn-gpu/lib/python3.10/site-packages/hyx_mpfdnn_repo.pth
+conda run -p <env-prefix> python - <<'PY'
+from pathlib import Path
+import site
+
+repo_root = Path("<repo-root>")
+site_dir = next(Path(p) for p in site.getsitepackages() if p.endswith("site-packages"))
+(site_dir / "hyx_mpfdnn_repo.pth").write_text(str(repo_root) + "\n")
+PY
 ```
 
 Then verify imports on a login node:
@@ -56,7 +57,7 @@ Then verify imports on a login node:
 source /etc/profile >/dev/null 2>&1 || true
 source /share/apps/anaconda3/etc/profile.d/conda.sh
 
-conda run -p /work/<user>/.conda/envs/hyx-mpfdnn-gpu \
+conda run -p <env-prefix> \
   python -c "import pathlib, ptagnn, torch, e3nn, ase; print(pathlib.Path(ptagnn.__file__).resolve()); print(torch.__version__); print(torch.cuda.is_available()); print(e3nn.__version__); print(ase.__version__)"
 ```
 
