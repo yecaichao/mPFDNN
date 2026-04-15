@@ -16,6 +16,73 @@ python -m pip install -r requirements.txt
 python setup.py install
 ```
 
+## GPU Conda Environment
+
+The repository has been validated with a dedicated GPU conda environment under a user account.
+
+Validated example:
+
+- environment path: `/work/phy-huangj/.conda/envs/hyx-mpfdnn-gpu`
+- repository path: `/work/phy-huangj/hyx/app-test/hyx-mpfdnn-developer`
+
+Recommended setup:
+
+```bash
+source /etc/profile >/dev/null 2>&1 || true
+source /share/apps/anaconda3/etc/profile.d/conda.sh
+
+conda create -y -p /work/<user>/.conda/envs/hyx-mpfdnn-gpu python=3.10 pip
+
+conda run -p /work/<user>/.conda/envs/hyx-mpfdnn-gpu \
+  python -m pip install --upgrade pip
+
+conda run -p /work/<user>/.conda/envs/hyx-mpfdnn-gpu \
+  python -m pip install \
+  --index-url https://download.pytorch.org/whl/cu121 \
+  --extra-index-url https://pypi.tuna.tsinghua.edu.cn/simple \
+  -r /path/to/mPFDNN/requirements.txt
+```
+
+To make `ptagnn` importable without mutating the source tree, register the repo path with a `.pth` file:
+
+```bash
+printf '%s\n' /path/to/mPFDNN \
+  > /work/<user>/.conda/envs/hyx-mpfdnn-gpu/lib/python3.10/site-packages/hyx_mpfdnn_repo.pth
+```
+
+Then verify imports on a login node:
+
+```bash
+source /etc/profile >/dev/null 2>&1 || true
+source /share/apps/anaconda3/etc/profile.d/conda.sh
+
+conda run -p /work/<user>/.conda/envs/hyx-mpfdnn-gpu \
+  python -c "import pathlib, ptagnn, torch, e3nn, ase; print(pathlib.Path(ptagnn.__file__).resolve()); print(torch.__version__); print(torch.cuda.is_available()); print(e3nn.__version__); print(ase.__version__)"
+```
+
+Important:
+
+- On a login node, `torch.cuda.is_available()` can still be `False`
+- Validate GPU availability from a GPU job or interactive GPU allocation
+
+### Validated Core Dependency Versions
+
+- `python==3.10`
+- `torch==2.2.2+cu121`
+- `torchvision==0.17.2+cu121`
+- `torchaudio==2.2.2+cu121`
+- `triton==2.2.0`
+- `ase==3.22.1`
+- `e3nn==0.4.4`
+- `numpy==1.26.4`
+- `scipy==1.13.0`
+- `pandas==2.2.1`
+- `matplotlib==3.8.4`
+- `matscipy==1.0.0`
+- `prettytable==3.10.0`
+- `torch-ema==0.3`
+- `opt-einsum-fx==0.1.4`
+
 ## Current Highlights
 
 Compared with the original public branch, the current codebase includes:
